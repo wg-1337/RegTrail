@@ -57,6 +57,17 @@ internal class FloatingOverlayView(
     var onDrag: ((dx: Int, dy: Int) -> Unit)? = null
 
     /**
+     * Called once when a pill drag ends.
+     *
+     * The per-frame [onDrag] callback must not write a preference file, and the
+     * drag can happen while the panel is attached to an Activity that is about to
+     * be torn down — so the *end* of the gesture is the only correct moment to
+     * persist where the pill was left. Without this the collapsed position was the
+     * one thing that did not survive a re-attach.
+     */
+    var onDragEnd: (() -> Unit)? = null
+
+    /**
      * Called when BACK is pressed while this window has input focus.
      *
      * Only the real overlay window sets it: there, a focusable window intercepts
@@ -168,7 +179,13 @@ internal class FloatingOverlayView(
             TextView(context).apply {
                 text = "RegTrail"
                 setTextColor(ACCENT)
-                textSize = 11f
+                // Pixels of the *display* density, not `sp`: `sp` follows the host
+                // Activity's `scaledDensity`, which is exactly the per-Activity value
+                // the panel must not follow (see [dp]).
+                setTextSize(
+                    android.util.TypedValue.COMPLEX_UNIT_PX,
+                    11f * PanelLayoutMath.density(context),
+                )
                 maxLines = 1
             },
             LinearLayout.LayoutParams(
@@ -333,11 +350,19 @@ internal class FloatingOverlayView(
                     // most annoying possible interaction bug.
                     val wasDrag = dragDistance > touchSlop
                     dragDistance = 0f
-                    if (!wasDrag) v.performClick()
+                    if (!wasDrag) {
+                        v.performClick()
+                    } else {
+                        onDragEnd?.invoke()
+                    }
                     return true
                 }
 
                 MotionEvent.ACTION_CANCEL -> {
+                    // A cancelled drag (the finger left the window, a dialog stole
+                    // the gesture) has still moved the pill: persist where it ended
+                    // up rather than losing the move.
+                    if (dragDistance > touchSlop) onDragEnd?.invoke()
                     dragDistance = 0f
                     return true
                 }
@@ -346,8 +371,17 @@ internal class FloatingOverlayView(
         }
     }
 
+    /**
+     * dp → px for the pill's own chrome.
+     *
+     * Uses the **display** density ([PanelLayoutMath.density]) so the pill keeps a
+     * constant pixel size inside a container that the controller also sizes with the
+     * display density: mixing the two (the Activity's density for the pill's padding,
+     * the display's for the window) made the pill look different in an Activity whose
+     * host app overrides its density — and the panel is *inside* that container.
+     */
     private fun dp(value: Float): Int =
-        (value * resources.displayMetrics.density + 0.5f).toInt()
+        (value * PanelLayoutMath.density(context) + 0.5f).toInt()
 
     internal companion object {
         /** Virtual origin for the web UI; every request is served from the APK. */

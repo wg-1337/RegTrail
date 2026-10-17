@@ -22,6 +22,13 @@ coreKtx = "1.19.1"
 coroutines = "1.11.0"
 serialization = "1.11.0"
 
+# ---- JVM unit tests ------------------------------------------------------
+# Plain JUnit 4. The two things worth testing on the JVM — the script library's
+# version files and the line-range arithmetic behind read_file/write_file — are
+# pure file/text logic, so they need no device, no Robolectric and no
+# instrumentation.
+junit = "4.13.2"
+
 # ---- Theming helpers -----------------------------------------------------
 materialColorUtilities = "6.0.0"
 
@@ -70,6 +77,9 @@ kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutine
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
 
 material-color-utilities = { module = "com.materialkolor:material-color-utilities", version.ref = "materialColorUtilities" }
+
+# JVM unit tests.
+junit = { module = "junit:junit", version.ref = "junit" }
 
 # LSPosed module API. `api` is compileOnly — bundling it makes the framework
 # refuse to load the module.

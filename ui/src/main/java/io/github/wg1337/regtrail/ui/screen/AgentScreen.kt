@@ -43,6 +43,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import io.github.wg1337.regtrail.ui.agent.AgentMessageUi
 import io.github.wg1337.regtrail.ui.agent.AgentUiState
+import io.github.wg1337.regtrail.ui.component.ExpandableRow
 
 /**
  * The Agent chat screen.
@@ -156,7 +157,9 @@ fun AgentScreen(
                         )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "例如：这个应用有哪些可疑的网络请求类？把某个校验方法的返回值改成 true。",
+                            "例如：这个应用有哪些可疑的网络请求类？把某个校验方法的返回值改成 true。\n" +
+                                "也可以说「把刚才那套改法记成脚本，以后启动就生效」——" +
+                                "Agent 会把它存进脚本库，之后在 设置 → 脚本 里能编辑、看版本、导出。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -251,15 +254,50 @@ private fun MessageBubble(message: AgentMessageUi) {
                     color = content.copy(alpha = 0.7f),
                 )
                 Spacer(Modifier.height(2.dp))
-                Text(
-                    message.text,
-                    style = if (message.role == AgentMessageUi.Role.Tool) {
-                        MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
-                    } else {
-                        MaterialTheme.typography.bodyMedium
-                    },
-                    color = content,
-                )
+                if (message.text.isNotBlank()) {
+                    Text(
+                        message.text,
+                        style = if (message.role == AgentMessageUi.Role.Tool) {
+                            MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                        } else {
+                            MaterialTheme.typography.bodyMedium
+                        },
+                        color = content,
+                    )
+                }
+
+                // The model's deliberation. Collapsed by default and visually
+                // separated from the answer: it is context for "why did it say
+                // that", not part of the reply.
+                message.reasoning?.takeIf { it.isNotBlank() }?.let { reasoning ->
+                    Spacer(Modifier.height(6.dp))
+                    ExpandableRow(
+                        summary = "思考过程 · ${reasoning.length} 字符",
+                        body = reasoning,
+                        mono = false,
+                    )
+                }
+
+                // This turn's tool calls, in order, one collapsed row each.
+                if (message.toolSteps.isNotEmpty()) {
+                    Spacer(Modifier.height(6.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        message.toolSteps.forEach { step ->
+                            ExpandableRow(
+                                summary = step.name + if (step.ok) "" else "（失败）",
+                                subtitle = step.result,
+                                body = buildString {
+                                    append("参数：")
+                                    append(step.arguments.ifBlank { "（无）" })
+                                    append("\n\n结果：\n")
+                                    append(step.result)
+                                },
+                                isError = !step.ok,
+                                mono = true,
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -272,5 +310,5 @@ private fun MessageBubble(message: AgentMessageUi) {
  * the Agent settings page both need to stay honest about.
  */
 internal const val AGENT_CAPABILITY_NOTE =
-    "Agent 可检查类/字段/View 树、挂方法 Hook、读写静态字段、以 Root 执行命令；" +
-        "不能读取 CPU 寄存器。"
+    "Agent 可检查类/字段/View 树、挂方法 Hook、读写静态字段、以 Root 执行命令、" +
+        "把一串操作存成脚本并在目标进程里重放；不能读取 CPU 寄存器。"

@@ -461,7 +461,16 @@
       box.appendChild(el('div', 'line ' + severityClass(lines[i]), lines[i]));
     }
 
-    if (view && atBottom) view.scrollTop = view.scrollHeight;
+    if (view && pendingLogScroll !== null) {
+      // A restored scrollTop is applied *after* the log DOM exists: renderLogs
+      // replaces every line, which resets scrollTop to 0. This is the one view
+      // whose content arrives asynchronously, so it is the one that needs the
+      // re-apply; every other tab keeps its DOM from boot.
+      view.scrollTop = pendingLogScroll;
+      pendingLogScroll = null;
+    } else if (view && atBottom) {
+      view.scrollTop = view.scrollHeight;
+    }
     updateLogHint(meta, lines.length);
   }
 
@@ -540,11 +549,117 @@
     if (name === 'mem') refreshMemoryState();
     if (name === 'agent') refreshAgentState();
     if (name === 'debug') refreshDebugHooks();
+    // Remember the tab: a recreated Activity reloads this page and must come
+    // back where the user was.
+    scheduleUiSave();
   }
 
   function currentTab() {
     var active = document.querySelector('.view.active');
     return active ? active.getAttribute('data-view') : '';
+  }
+
+  /* ---- UI state across Activity switches ------------------------------- */
+
+  /*
+   * The host Activity can be recreated at any time (rotation, task switch, or the
+   * DecorView mechanism re-attaching on a new Activity), and the WebView reloads
+   * with it. Without this, every such reload bounced the user back to 状态 with
+   * the log scrolled to the top — which reads as "the panel lost my place" on a
+   * surface whose whole job is staying put while the host app changes screens.
+   *
+   * Only the UI *position* is stored: the active tab and each tab's scrollTop.
+   * Nothing about the data, which belongs to the native side and is re-read on
+   * boot anyway. localStorage rather than a bridge call because it survives a
+   * reload, is synchronous, and needs no round trip before the first paint.
+   *
+   * CSS px here are dp (the native side sizes the WebView in dp and the page uses
+   * no density conversion), so these numbers mean the same thing before and after
+   * the reload.
+   */
+  var UI_STATE_KEY = 'regtrail.ui';
+  var pendingUiState = null;
+  var pendingLogScroll = null;
+  var uiSaveScheduled = false;
+
+  function readUiState() {
+    try {
+      var raw = window.localStorage.getItem(UI_STATE_KEY);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** Coalesces bursts of scroll events into one write per frame. */
+  function scheduleUiSave() {
+    if (uiSaveScheduled) return;
+    uiSaveScheduled = true;
+    raf(function () {
+      uiSaveScheduled = false;
+      writeUiState();
+    });
+  }
+
+  function writeUiState() {
+    try {
+      var state = { tab: currentTab(), scroll: {} };
+      var views = document.querySelectorAll('.view');
+      for (var i = 0; i < views.length; i++) {
+        var name = views[i].getAttribute('data-view');
+        if (name) state.scroll[name] = Math.round(views[i].scrollTop || 0);
+      }
+      window.localStorage.setItem(UI_STATE_KEY, JSON.stringify(state));
+    } catch (e) {
+      // localStorage can be unavailable (restricted file:// origins, private
+      // mode). Losing the restore is acceptable; throwing here would take the
+      // whole panel down for a cosmetic feature.
+    }
+  }
+
+  /** Applies the stored tab and scroll positions. Called once, from boot(). */
+  function restoreUiState() {
+    pendingUiState = readUiState();
+    if (!pendingUiState) return;
+
+    // Order matters twice over: the log scroll has to be known before the tab is
+    // shown, because showTab('log') starts the poller whose first renderLogs is
+    // synchronous — and that render is what consumes `pendingLogScroll`.
+    if (pendingUiState.scroll && typeof pendingUiState.scroll.log === 'number') {
+      pendingLogScroll = pendingUiState.scroll.log;
+    }
+
+    var tab = pendingUiState.tab;
+    // Validated, not interpolated blindly: the value comes from storage, and it
+    // is used to build a selector.
+    if (typeof tab === 'string' && /^[a-z]+$/.test(tab) &&
+        document.querySelector('.tab[data-tab="' + tab + '"]')) {
+      showTab(tab);
+    }
+
+    applyStoredScroll();
+  }
+
+  /** Restores the scrollTop of every tab whose DOM already exists. */
+  function applyStoredScroll() {
+    if (!pendingUiState || !pendingUiState.scroll) return;
+    var views = document.querySelectorAll('.view');
+    for (var i = 0; i < views.length; i++) {
+      var name = views[i].getAttribute('data-view');
+      var value = name ? pendingUiState.scroll[name] : null;
+      if (typeof value === 'number') views[i].scrollTop = value;
+    }
+  }
+
+  function initUiStateTracking() {
+    var container = byId('views');
+    if (!container) return;
+    // `scroll` does not bubble, so it is registered in the capture phase on the
+    // container: one handler covers every tab.
+    container.addEventListener('scroll', scheduleUiSave, true);
+    window.addEventListener('pagehide', writeUiState);
   }
 
   /* ---- Buttons -------------------------------------------------------- */
@@ -2034,6 +2149,7 @@
         '下面的工具控制台现在就能用');
     } else {
       parts.push('模型 ' + (data.model || '?') + ' · ' + (data.baseUrl || '?'));
+      if (data.thinking) parts.push('思考 ' + data.thinking);
       parts.push('工具 ' + ((data.tools || []).length) + ' 个');
       if (typeof data.messages === 'number') parts.push('对话 ' + data.messages + ' 条消息');
       if (!data.internet) {
@@ -2086,17 +2202,116 @@
       }
 
       var data = res.data || {};
-      if (Object.prototype.toString.call(data.steps) === '[object Array]' &&
-          data.steps.length) {
-        appendAgentMessage('tool', data.steps.join('\n'));
-      }
-      appendAgentMessage('assistant', data.reply || '（空回复）');
+      var reasoning = typeof data.reasoning === 'string' ? data.reasoning : '';
+      var steps = Object.prototype.toString.call(data.steps) === '[object Array]'
+        ? data.steps
+        : [];
+      appendAgentTurn(data.reply || '（空回复）', steps, reasoning);
       setLine('agent-status', '完成' +
-        (data.allowDestructive ? '（本次允许破坏性操作）' : ''));
+        (data.allowDestructive ? '（本次允许破坏性操作）' : '') +
+        (data.reasoning ? ' · 思考 ' + data.reasoning.length + ' 字符' : ''));
       refreshAgentState();
     }, function (data) {
       if (data && data.progress) setLine('agent-status', data.progress);
     }, AGENT_TIMEOUT_MS);
+  }
+
+  /*
+   * Renders one finished turn as a single bubble:
+   *
+   *   [collapsed tool steps]   ← one <details> per call, closed by default
+   *   [the reply]
+   *   [collapsed 思考过程]     ← reasoning_content, closed by default
+   *
+   * The order is deliberate: the user's eye lands on the steps first (what was
+   * done), then the answer, and the deliberation is available but never in the
+   * way. Everything is built with `createElement`/`textContent` — this content
+   * came from a model and from a third-party process, so it must never be
+   * interpreted as HTML.
+   */
+  function appendAgentTurn(reply, steps, reasoning) {
+    var log = byId('agent-log');
+    if (!log) return;
+
+    var bubble = el('div', 'msg assistant');
+    if (steps.length) bubble.appendChild(stepsBlock(steps));
+    bubble.appendChild(el('div', null, reply));
+    if (reasoning) bubble.appendChild(reasoningBlock(reasoning));
+
+    log.appendChild(bubble);
+    trimAgentLog(log);
+    scrollAgentToEnd();
+  }
+
+  /** The ordered list of tool calls of one turn. */
+  function stepsBlock(steps) {
+    var wrap = el('div', 'agent-steps');
+    for (var i = 0; i < steps.length; i++) {
+      wrap.appendChild(stepRow(steps[i], i + 1));
+    }
+    return wrap;
+  }
+
+  /**
+   * One tool call: `名称 · 结果首行` while collapsed, arguments + full result when
+   * opened.
+   *
+   * Accepts the older shape too (a bare string), because a module APK and a
+   * settings app built from different commits can be paired on one device: the
+   * page must render something useful instead of `[object Object]`.
+   */
+  function stepRow(step, position) {
+    var name = '工具';
+    var args = '';
+    var result = '';
+    var ok = true;
+
+    if (typeof step === 'string') {
+      result = step;
+      name = step.split(' ')[0] || '工具';
+    } else if (step && typeof step === 'object') {
+      name = step.name || '工具';
+      args = step.args || '';
+      result = step.result || '';
+      ok = step.ok !== false;
+    }
+
+    var node = document.createElement('details');
+    node.className = 'step';
+    node.setAttribute('data-ok', ok ? '1' : '0');
+    node.appendChild(el('summary', null,
+      position + '. ' + name + (result ? ' · ' + firstLine(result) : '') +
+      (ok ? '' : '（失败）')));
+
+    node.appendChild(el('div', 'step-body',
+      '参数：' + (args || '（无）') + '\n\n结果：\n' + (result || '（无）')));
+    return node;
+  }
+
+  /** `reasoning_content`, collapsed: it is context, not the answer. */
+  function reasoningBlock(reasoning) {
+    var node = document.createElement('details');
+    node.className = 'reasoning';
+    node.appendChild(el('summary', null, '思考过程 · ' + reasoning.length + ' 字符'));
+    node.appendChild(el('div', 'reasoning-body', reasoning));
+    return node;
+  }
+
+  /** The first line of a possibly long, already-truncated result. */
+  function firstLine(text) {
+    var cut = String(text).split('\n')[0];
+    return cut.length > 90 ? cut.slice(0, 90) + '…' : cut;
+  }
+
+  function trimAgentLog(log) {
+    while (log.childNodes.length > AGENT_MAX_LINES) {
+      log.removeChild(log.firstChild);
+    }
+  }
+
+  function scrollAgentToEnd() {
+    var view = document.querySelector('.view[data-view="agent"]');
+    if (view) view.scrollTop = view.scrollHeight;
   }
 
   function appendAgentMessage(role, text) {
@@ -2104,12 +2319,8 @@
     if (!log) return;
 
     log.appendChild(el('div', 'msg ' + role, text));
-    while (log.childNodes.length > AGENT_MAX_LINES) {
-      log.removeChild(log.firstChild);
-    }
-
-    var view = document.querySelector('.view[data-view="agent"]');
-    if (view) view.scrollTop = view.scrollHeight;
+    trimAgentLog(log);
+    scrollAgentToEnd();
   }
 
   function resetAgentConversation() {
@@ -2210,6 +2421,11 @@
       initMemory();
       initDebug();
       initAgent();
+      initUiStateTracking();
+      // After the tab handlers exist and before anything starts polling, so the
+      // restored tab is the one that gets polled and no stray timers run for a
+      // tab the user is not looking at.
+      restoreUiState();
       request('ready');
       refreshStatus();
       renderSize();

@@ -10,6 +10,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Palette
@@ -39,6 +40,7 @@ import io.github.wg1337.regtrail.ui.component.toHexString
 import io.github.wg1337.regtrail.ui.debug.DebugUiState
 import io.github.wg1337.regtrail.ui.nav.Dest
 import io.github.wg1337.regtrail.ui.patch.PatchUiState
+import io.github.wg1337.regtrail.ui.script.ScriptUiState
 import io.github.wg1337.regtrail.ui.state.AppSettings
 import io.github.wg1337.regtrail.ui.theme.toComposeColor
 
@@ -70,6 +72,7 @@ fun SettingsScreen(
     debugState: DebugUiState,
     patchState: PatchUiState,
     agentState: AgentUiState,
+    scriptState: ScriptUiState,
     overlayMechanism: OverlayMechanism,
     systemHookAcknowledged: Boolean,
     onThemeChange: ((ThemeConfig) -> ThemeConfig) -> Unit,
@@ -241,6 +244,23 @@ fun SettingsScreen(
                 icon = Icons.Filled.BugReport,
                 onClick = { onNavigate(Dest.Debug) },
                 dividerAbove = true,
+            )
+        }
+
+        // ---- 脚本 ---------------------------------------------------------
+        SettingsGroup("脚本") {
+            SettingsNavRow(
+                title = "脚本库",
+                subtitle = when {
+                    scriptState.entries.isEmpty() ->
+                        "还没有脚本 · 可以新建，也可以让 Agent 把一次成功的调试记成脚本"
+                    else ->
+                        "${scriptState.entries.size} 个脚本 · " +
+                            "${scriptState.entries.count { it.enabled }} 个启用 · " +
+                            "每次保存生成一个新版本"
+                },
+                icon = Icons.Filled.Description,
+                onClick = { onNavigate(Dest.Scripts) },
             )
         }
 

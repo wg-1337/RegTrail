@@ -138,4 +138,11 @@ dependencies {
     implementation(libs.bouncycastle.bcprov)
 
     debugImplementation(libs.compose.ui.tooling)
+
+    // ---- JVM unit tests -------------------------------------------------
+    // `ScriptStore` (versioned files on disk) and `LineRangeEdit` (the
+    // arithmetic behind read_file/write_file) are pure JVM logic. Testing them
+    // here is what makes "3 saves then restore v1" and "replace lines 2..3,
+    // reject out-of-range" checkable without a device.
+    testImplementation(libs.junit)
 }

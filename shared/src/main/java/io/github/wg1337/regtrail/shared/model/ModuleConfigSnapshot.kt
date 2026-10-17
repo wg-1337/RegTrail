@@ -144,6 +144,31 @@ data class ModuleConfigSnapshot(
     /** Tool rounds one turn may use; 0 = the module's own default. */
     val agentMaxRounds: Int = 0,
 
+    /**
+     * 思考等级 for the in-window Agent, as [ThinkingLevel.wire] text.
+     *
+     * A **string** rather than the enum on purpose: this file is written by the
+     * settings app and read by whatever module build is installed, so a value a
+     * newer app invents must decode to *something* instead of throwing and
+     * taking the whole snapshot (and with it the overlay) down. The matching
+     * reader is [ThinkingLevel.fromWire], which falls back to
+     * [ThinkingLevel.DEFAULT] for anything it does not recognise.
+     *
+     * Empty (the default) means "the module's own default", which is the same
+     * value, so an older `config.json` without this key behaves identically.
+     */
+    val agentThinking: String = "",
+
+    /**
+     * Whether the in-window Agent's request carries the thinking fields, as
+     * [ThinkingWire.wire] text (`"auto"` when absent).
+     *
+     * Published for the same reason as [agentThinking]: the loop that builds the
+     * request runs inside the target process, so the decision has to travel.
+     * Empty means [ThinkingWire.Auto], which is also what an older config gets.
+     */
+    val agentThinkingWire: String = "",
+
     /** Scripts the module may auto-run, keyed by trigger (see docs/PLAN.md 5-③). */
     val scripts: List<ScriptSpec> = emptyList(),
 
@@ -270,6 +295,15 @@ enum class OverlayMechanism {
  * Serialized as JSON so it can be exported, shared, and edited as text. The
  * shape is deliberately flat and forward-compatible: unknown `kind` values are
  * skipped rather than treated as errors.
+ *
+ * ## Where the authoritative copy lives
+ * The settings app keeps a **script library on disk** (one directory per
+ * script, one file per version — see `ScriptStore`). What is published into
+ * `config.json` is only the *current* version of each enabled script, which is
+ * the minimum the injected side needs to run it. [version] is therefore
+ * provenance: it says which library version this snapshot came from, so a
+ * window that runs a script can report "v3" and the user can go back to the
+ * library and find exactly that revision.
  */
 @Serializable
 data class ScriptSpec(
@@ -282,6 +316,14 @@ data class ScriptSpec(
     /** For [ScriptTrigger.MethodEnter]: `com.example.Foo#bar`. */
     val triggerMethod: String? = null,
     val actions: List<ScriptAction> = emptyList(),
+    /**
+     * Library version this spec was published from; `0` when it did not come
+     * from the library (a hand-written config, or a build older than the
+     * library). Defaulted so every existing `config.json` still decodes.
+     */
+    val version: Int = 0,
+    /** Free-form note: what the script is for, recorded when it was saved. */
+    val description: String = "",
 )
 
 /** When a script runs. Mirrors docs/PLAN.md 5-③. */

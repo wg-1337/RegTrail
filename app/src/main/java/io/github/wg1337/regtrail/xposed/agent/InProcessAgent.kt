@@ -52,8 +52,34 @@ import kotlinx.serialization.json.jsonPrimitive
  */
 internal object InProcessAgent {
 
-    /** One finished turn: the final text plus the tool steps that led to it. */
-    data class Outcome(val reply: String, val steps: List<String>)
+    /**
+     * One tool call of the turn, as the panel renders it.
+     *
+     * One collapsed row per call, with a one-line [result] — the panel is 300 dp
+     * wide, so a raw argument object plus a raw JSON result per step was
+     * unreadable and pushed the actual answer off screen.
+     */
+    data class Step(
+        val name: String,
+        /** Arguments as the model sent them, already truncated. */
+        val arguments: String = "",
+        /** One-line result summary. */
+        val result: String = "",
+        val ok: Boolean = true,
+    )
+
+    /** One finished turn: the final text, the tool steps, and the reasoning. */
+    data class Outcome(
+        val reply: String,
+        val steps: List<Step>,
+        /**
+         * The model's `reasoning_content`, when it thought before answering.
+         *
+         * Kept out of [reply] on purpose: it is deliberation, not the answer, and
+         * the page renders it in a `<details>` block that starts collapsed.
+         */
+        val reasoning: String = "",
+    )
 
     /** Keeps a long chat from pinning an unbounded message list in the host heap. */
     private const val MAX_HISTORY_MESSAGES = 28
@@ -63,6 +89,14 @@ internal object InProcessAgent {
 
     /** Longest tool result fed back to the model, in characters. */
     private const val MAX_TOOL_CHARS = 4000
+
+    /** Width of the collapsed step summary in the panel. */
+    private const val STEP_SUMMARY_CHARS = 140
+
+    /** Width of the collapsed step's argument preview. */
+    private const val STEP_ARGS_CHARS = 160
+
+    private val WHITESPACE = Regex("\\s+")
 
     private val prettyJson = Json { prettyPrint = true; encodeDefaults = false }
 
@@ -107,7 +141,8 @@ internal object InProcessAgent {
 
         val tools = toolCatalog()
         val client = OpenAiCompatibleClient(config)
-        val steps = ArrayList<String>()
+        val steps = ArrayList<Step>()
+        val reasoningParts = ArrayList<String>()
         val rounds = config.maxToolRounds.coerceIn(1, MAX_ROUNDS)
 
         synchronized(history) {
@@ -127,17 +162,20 @@ internal object InProcessAgent {
             val completion = client.complete(messages, tools).getOrElse { throw it }
 
             if (completion.content.isNotBlank()) reply = completion.content
+            if (completion.reasoning.isNotBlank()) reasoningParts += completion.reasoning
 
             if (completion.toolCalls.isEmpty()) {
                 synchronized(history) {
                     if (completion.content.isNotBlank()) {
-                        history.addLast(
-                            OpenAiCompatibleClient.message("assistant", completion.content),
-                        )
+                        // The raw message, not a rebuilt one: when `tools` is in
+                        // the request the DeepSeek guide requires every later
+                        // request to carry the earlier `reasoning_content` back,
+                        // and rebuilding the message would drop it.
+                        history.addLast(completion.rawMessage)
                     }
                     trim()
                 }
-                return Outcome(reply, steps)
+                return Outcome(reply, steps, reasoningParts.joinToString("\n\n"))
             }
 
             // The assistant message that *requested* the calls must be echoed back
@@ -150,11 +188,29 @@ internal object InProcessAgent {
             for (call in completion.toolCalls) {
                 if (shouldStop()) throw AgentException("已取消")
                 val tool = tools.firstOrNull { it.name == call.name }
+                val argsPreview = previewArguments(call.rawArguments)
                 val text = when {
-                    tool == null -> "错误：未知工具 ${call.name}"
-                    tool.destructive && !allowDestructive ->
+                    tool == null -> {
+                        steps += Step(
+                            name = call.name,
+                            arguments = argsPreview,
+                            result = "未知工具",
+                            ok = false,
+                        )
+                        "错误：未知工具 ${call.name}"
+                    }
+
+                    tool.destructive && !allowDestructive -> {
+                        steps += Step(
+                            name = call.name,
+                            arguments = argsPreview,
+                            result = "需要「允许破坏性操作」",
+                            ok = false,
+                        )
                         "错误：${call.name} 会修改目标应用，需要用户在 Agent 面板勾选" +
                             "「允许破坏性操作」后才能执行。请向用户说明你要做什么，等他开启。"
+                    }
+
                     else -> {
                         onStep("第 $round 轮：${call.name}")
                         val response = runCatching { execute(call.name, call.arguments) }
@@ -165,7 +221,12 @@ internal object InProcessAgent {
                                 )
                             }
                         val rendered = renderToolResult(response)
-                        steps += "${call.name} → ${rendered.lineSequence().first().take(160)}"
+                        steps += Step(
+                            name = call.name,
+                            arguments = argsPreview,
+                            result = summarize(rendered),
+                            ok = response.ok,
+                        )
                         rendered
                     }
                 }
@@ -183,7 +244,26 @@ internal object InProcessAgent {
                     "或者把问题拆得更小：先定位类，再看字段，最后才决定要不要改写。）"
             },
             steps,
+            reasoningParts.joinToString("\n\n"),
         )
+    }
+
+    /**
+     * Squeezes a tool result onto one line for the collapsed step row.
+     *
+     * The full text still goes back to the model — this is only what the panel
+     * shows while the row is closed. Keeping it short is the whole point: the
+     * panel is a narrow floating window, not a desktop console.
+     */
+    fun summarize(text: String, limit: Int = STEP_SUMMARY_CHARS): String {
+        val oneLine = text.replace(WHITESPACE, " ").trim()
+        return if (oneLine.length <= limit) oneLine else oneLine.take(limit) + "…"
+    }
+
+    /** Arguments, squeezed onto one line and truncated, for the step row. */
+    private fun previewArguments(raw: String): String {
+        val oneLine = raw.replace(WHITESPACE, " ").trim()
+        return if (oneLine.length <= STEP_ARGS_CHARS) oneLine else oneLine.take(STEP_ARGS_CHARS) + "…"
     }
 
     /**
@@ -425,6 +505,44 @@ internal object InProcessAgent {
             """.trimIndent(),
             destructive = true,
         ),
+        // ---- Scripts -------------------------------------------------------
+        //
+        // The in-window Agent can see and *run* the scripts the settings app
+        // published, because that is exactly what this process has: the script
+        // list from `config.json` and the engine that executes it.
+        //
+        // Authoring is deliberately NOT here. The library lives in the settings
+        // app's private storage (`filesDir/scripts/<id>/vNNNN.json`) with its
+        // version history; a target process can neither read nor write that, and
+        // there is no reverse channel to ask for it. Rather than fake a
+        // half-working "create" that would vanish with the process, the tools
+        // that make sense in-process are exposed and the prompt says where the
+        // durable ones live.
+        AgentTool(
+            name = "script_list",
+            description = "列出设置端已下发到本进程的脚本（id、名称、触发时机、动作数、版本）。",
+            parameters = """{"type":"object","properties":{}}""",
+        ),
+        AgentTool(
+            name = "script_get",
+            description = "读取一个已下发脚本的完整内容（触发时机 + 动作列表）。",
+            parameters = """
+                {"type":"object","properties":{
+                  "id":{"type":"string","description":"脚本 id，来自 script_list"}
+                },"required":["id"]}
+            """.trimIndent(),
+        ),
+        AgentTool(
+            name = "script_run",
+            description = "立刻在本进程里手动执行一个已下发的脚本（不需要等触发时机）。" +
+                "执行结果会写进日志，可用诊断「我改的东西到底生效了吗」。",
+            parameters = """
+                {"type":"object","properties":{
+                  "id":{"type":"string","description":"脚本 id"}
+                },"required":["id"]}
+            """.trimIndent(),
+            destructive = true,
+        ),
     )
 
     /**
@@ -446,10 +564,14 @@ internal object InProcessAgent {
         - hook_method / list_hooks / unhook：方法级调试
         - mem_scan / mem_refine / mem_write / mem_revert：在当前进程内存里搜索与改写数值
           （不需要 Root；写入会记录原始值并且可以还原）
+        - script_list / script_get / script_run：查看并立刻执行设置端下发的脚本
 
         你**不能**做的事（不要承诺、不要尝试）：
         - 执行 shell 命令、读写其它进程的内存、读取 CPU 寄存器
         - 修改目标 APK 或重新签名
+        - 在本进程内**新建或修改**脚本：脚本库在 RegTrail 设置端的私有目录里，带版本历史，
+          这里既读不到也写不了。要新建/改脚本，请让用户到设置端的 Agent 里说一遍
+          （那边的 script_create / script_update 会存库并立刻下发，几秒后这里就能 script_run）。
         - 在用户没有勾选「允许破坏性操作」时修改任何状态（工具会直接拒绝并告诉你）
 
         工作方式：
@@ -459,5 +581,13 @@ internal object InProcessAgent {
         - 破坏性操作前先用一句话说明后果；写入后提醒用户可以用「还原」回滚。
         - 工具返回错误时如实说明原因，不要编造结果。
         - 用中文回答，简洁、具体，引用真实的类名、方法签名与地址。
+
+        脚本是调试会话的持久形态：
+        - 你在这个进程里验通了一串操作（改对返回值、写对内存、挂对 Hook），
+          而用户希望**下次启动还生效**时，告诉他：到 RegTrail 设置端的 Agent 里说
+          「把刚才这套改法记成脚本，触发时机用应用启动」，那边的 script_create 会存进脚本库。
+        - 已经下发到本进程的脚本，可以直接用 script_run 跑一遍验证；跑完看日志确认真的生效。
+        - 记脚本的时候，触发时机越早越省事：能 AppOnCreate 就别 Manual；
+          只在某个界面才有意义的，用 ActivityOnResume + 目标类名。
     """.trimIndent()
 }

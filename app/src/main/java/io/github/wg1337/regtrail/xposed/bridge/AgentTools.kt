@@ -11,6 +11,7 @@ import io.github.wg1337.regtrail.xposed.debug.DebugEngine
 import io.github.wg1337.regtrail.xposed.debug.DebugHookBehavior
 import io.github.wg1337.regtrail.xposed.debug.InstanceRegistry
 import io.github.wg1337.regtrail.xposed.mem.MemorySessions
+import io.github.wg1337.regtrail.xposed.script.ScriptEngine
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -70,6 +71,13 @@ internal object AgentTools {
             "mem_refine" -> memRefine(args, shouldStop)
             "mem_write" -> memWrite(args)
             "mem_revert" -> memRevert(args)
+            // Scripts: the ones the settings app published, executed by the
+            // script engine that already owns the trigger hooks. `script_run` is
+            // the *same* entry point the floating window's 工具 tab calls, so
+            // there is one implementation and it reports failures the same way.
+            "script_list" -> scriptList()
+            "script_get" -> scriptGet(args)
+            "script_run" -> scriptRun(args, context)
             else -> toolError("unknown tool: $name")
         }
     } catch (t: Throwable) {
@@ -457,6 +465,107 @@ internal object AgentTools {
                 ),
             )
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Scripts
+    // -----------------------------------------------------------------------
+
+    /**
+     * The scripts the settings app published into `config.json`.
+     *
+     * Only entries the engine actually holds are listed: a script whose
+     * `enabled` flag is false is not registered, so offering it here would
+     * promise a run that cannot happen.
+     */
+    private fun scriptList(): BridgeApi.Response {
+        val scripts = ScriptEngine.scriptEntries()
+        return BridgeApi.Response(
+            ok = true,
+            data = buildJsonObject {
+                put("count", JsonPrimitive(scripts.size))
+                put(
+                    "scripts",
+                    buildJsonArray {
+                        scripts.forEach { spec ->
+                            add(
+                                buildJsonObject {
+                                    put("id", JsonPrimitive(spec.id))
+                                    put("name", JsonPrimitive(spec.name))
+                                    put("trigger", JsonPrimitive(spec.trigger.name))
+                                    put("actions", JsonPrimitive(spec.actions.size))
+                                    put("version", JsonPrimitive(spec.version))
+                                    if (spec.description.isNotBlank()) {
+                                        put("description", JsonPrimitive(spec.description))
+                                    }
+                                },
+                            )
+                        }
+                    },
+                )
+            },
+        )
+    }
+
+    /** One published script in full, so the model can reason about its actions. */
+    private fun scriptGet(args: JsonObject): BridgeApi.Response {
+        val id = args.str("id") ?: return toolError("missing 'id'")
+        val spec = ScriptEngine.scriptEntries().firstOrNull { it.id == id }
+            ?: return toolError("没有已下发的脚本 $id（先看 script_list）")
+
+        return BridgeApi.Response(
+            ok = true,
+            data = buildJsonObject {
+                put("id", JsonPrimitive(spec.id))
+                put("name", JsonPrimitive(spec.name))
+                put("enabled", JsonPrimitive(spec.enabled))
+                put("trigger", JsonPrimitive(spec.trigger.name))
+                put("version", JsonPrimitive(spec.version))
+                spec.triggerTarget?.let { put("triggerTarget", JsonPrimitive(it)) }
+                spec.triggerMethod?.let { put("triggerMethod", JsonPrimitive(it)) }
+                put(
+                    "actions",
+                    buildJsonArray {
+                        spec.actions.forEach { action ->
+                            add(
+                                buildJsonObject {
+                                    put("kind", JsonPrimitive(action.kind.name))
+                                    action.className?.let { put("className", JsonPrimitive(it)) }
+                                    action.memberName?.let { put("memberName", JsonPrimitive(it)) }
+                                    action.signature?.let { put("signature", JsonPrimitive(it)) }
+                                    action.value?.let { put("value", JsonPrimitive(it)) }
+                                    put("valueType", JsonPrimitive(action.valueType.name))
+                                    action.receiver?.let { put("receiver", JsonPrimitive(it)) }
+                                },
+                            )
+                        }
+                    },
+                )
+            },
+        )
+    }
+
+    /**
+     * Runs one script now, from inside the process it will act on.
+     *
+     * `ScriptEngine.runManual` reports failure as a Chinese sentence rather than
+     * throwing, so it is passed through verbatim instead of being turned into a
+     * generic "工具执行失败".
+     */
+    private fun scriptRun(
+        args: JsonObject,
+        context: android.content.Context?,
+    ): BridgeApi.Response {
+        val id = args.str("id") ?: return toolError("missing 'id'")
+        val result = ScriptEngine.runManual(id, context)
+        RegTrailLog.i("tool script_run $id → $result")
+        return BridgeApi.Response(
+            ok = true,
+            data = buildJsonObject {
+                put("id", JsonPrimitive(id))
+                put("result", JsonPrimitive(result))
+            },
+        )
     }
 
     // -----------------------------------------------------------------------

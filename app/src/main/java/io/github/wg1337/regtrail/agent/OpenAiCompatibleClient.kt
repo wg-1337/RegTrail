@@ -1,6 +1,7 @@
 package io.github.wg1337.regtrail.agent
 
 import io.github.wg1337.regtrail.shared.bridge.BridgeApi
+import io.github.wg1337.regtrail.shared.model.ThinkingLevel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -59,33 +60,7 @@ class OpenAiCompatibleClient(private val config: AgentConfig) {
         tools: List<AgentTool>,
     ): Result<Completion> = withContext(Dispatchers.IO) {
         runCatching {
-            val body = buildJsonObject {
-                put("model", JsonPrimitive(config.model))
-                put("messages", buildJsonArray { messages.forEach { add(it) } })
-                put("temperature", JsonPrimitive(0.2))
-                if (tools.isNotEmpty()) {
-                    put("tools", buildJsonArray {
-                        tools.forEach { tool ->
-                            add(
-                                buildJsonObject {
-                                    put("type", JsonPrimitive("function"))
-                                    putJsonObject("function") {
-                                        put("name", JsonPrimitive(tool.name))
-                                        put("description", JsonPrimitive(tool.description))
-                                        // The schema is stored as JSON text; it must be
-                                        // embedded as a real object, not a string.
-                                        put(
-                                            "parameters",
-                                            json.parseToJsonElement(tool.parameters),
-                                        )
-                                    }
-                                },
-                            )
-                        }
-                    })
-                    put("tool_choice", JsonPrimitive("auto"))
-                }
-            }
+            val body = buildBody(messages, tools)
 
             val url = URL(config.baseUrl.trimEnd('/') + "/chat/completions")
             val connection = (url.openConnection() as HttpURLConnection).apply {
@@ -123,6 +98,89 @@ class OpenAiCompatibleClient(private val config: AgentConfig) {
         }
     }
 
+    /**
+     * Builds the `POST /chat/completions` body, thinking fields included when
+     * the configured endpoint expects them.
+     *
+     * ## What the thinking fields are, exactly
+     * Per the DeepSeek 思考模式 guide
+     * (https://api-docs.deepseek.com/zh-cn/guides/thinking_mode), the
+     * OpenAI-format request has two independent controls:
+     *
+     * ```
+     * 思考模式开关: {"thinking": {"type": "enabled/disabled"}}
+     * 思考强度控制: {"reasoning_effort": "low/high/max"}
+     * ```
+     *
+     * so this emits a **top-level** `thinking` object plus a top-level
+     * `reasoning_effort` string. (The guide's Python example puts `thinking`
+     * inside `extra_body`, which is only how the OpenAI *SDK* is told to forward
+     * an unknown field — on the wire it is a plain body member.)
+     *
+     * `reasoning_effort` is omitted when the level is [ThinkingLevel.Off],
+     * because the documented way to turn thinking off is
+     * `{"thinking":{"type":"disabled"}}` and an effort alongside `disabled`
+     * would be a contradiction.
+     *
+     * ## Why `temperature` is conditional
+     * The same guide states 思考模式不支持 `temperature`、`presence_penalty`、
+     * `frequency_penalty` — "设置参数不会报错，但也不会生效". Sending a
+     * temperature the service silently ignores is worse than not sending it: the
+     * user would tune a knob that does nothing. So when thinking is on, the
+     * sampling temperature is left out; when thinking is off, the historical 0.2
+     * still applies.
+     *
+     * `internal` rather than `private` so the JVM test suite can assert the exact
+     * body: the thinking parameters are a wire contract with the provider, and a
+     * regression there is invisible until a user notices the model stopped
+     * thinking (or started getting HTTP 400).
+     */
+    internal fun buildBody(messages: List<JsonObject>, tools: List<AgentTool>): JsonObject {
+        val thinking = config.thinking
+        val sendThinking = config.thinkingWire.sendsFor(config.baseUrl)
+
+        return buildJsonObject {
+            put("model", JsonPrimitive(config.model))
+            put("messages", buildJsonArray { messages.forEach { add(it) } })
+
+            if (!sendThinking || thinking == ThinkingLevel.Off) {
+                // Deterministic-ish sampling, as before. Only skipped when the
+                // service is documented to ignore it.
+                put("temperature", JsonPrimitive(0.2))
+            }
+
+            if (sendThinking) {
+                putJsonObject("thinking") {
+                    put("type", JsonPrimitive(thinking.thinkingType))
+                }
+                thinking.effort?.let { put("reasoning_effort", JsonPrimitive(it)) }
+            }
+
+            if (tools.isNotEmpty()) {
+                put("tools", buildJsonArray {
+                    tools.forEach { tool ->
+                        add(
+                            buildJsonObject {
+                                put("type", JsonPrimitive("function"))
+                                putJsonObject("function") {
+                                    put("name", JsonPrimitive(tool.name))
+                                    put("description", JsonPrimitive(tool.description))
+                                    // The schema is stored as JSON text; it must be
+                                    // embedded as a real object, not a string.
+                                    put(
+                                        "parameters",
+                                        json.parseToJsonElement(tool.parameters),
+                                    )
+                                }
+                            },
+                        )
+                    }
+                })
+                put("tool_choice", JsonPrimitive("auto"))
+            }
+        }
+    }
+
     private fun parseCompletion(text: String): Completion {
         val root = runCatching { json.parseToJsonElement(text).jsonObject }
             .getOrElse { throw AgentException("响应不是合法 JSON：${text.take(200)}") }
@@ -142,6 +200,11 @@ class OpenAiCompatibleClient(private val config: AgentConfig) {
             ?: throw AgentException("响应中没有 message 字段")
 
         val content = message["content"]?.jsonPrimitive?.contentOrNull.orEmpty()
+
+        // 思维链. The guide returns it next to `content` as `reasoning_content`;
+        // it is *not* part of the answer, so it is kept in its own field and the
+        // UI shows it collapsed rather than appending it to the chat text.
+        val reasoning = message["reasoning_content"]?.jsonPrimitive?.contentOrNull.orEmpty()
 
         val toolCalls = message["tool_calls"]?.jsonArray?.mapNotNull { element ->
             val call = element.jsonObject
@@ -163,6 +226,7 @@ class OpenAiCompatibleClient(private val config: AgentConfig) {
 
         return Completion(
             content = content,
+            reasoning = reasoning,
             toolCalls = toolCalls,
             finishReason = finishReason,
             rawMessage = message,
@@ -188,6 +252,16 @@ class OpenAiCompatibleClient(private val config: AgentConfig) {
         val finishReason: String?,
         /** Passed back verbatim so the provider sees its own message again. */
         val rawMessage: JsonObject,
+        /**
+         * `reasoning_content`, when the service runs in thinking mode.
+         *
+         * Empty when the model did not think or the endpoint does not support
+         * it. **Never merged into [content]**: with `tools` present the guide
+         * requires it to be sent back verbatim, which happens automatically
+         * because [rawMessage] carries it — the transcript re-appends the raw
+         * assistant message rather than a rebuilt one.
+         */
+        val reasoning: String = "",
     )
 
     data class ToolCall(

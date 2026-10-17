@@ -3,7 +3,9 @@ package io.github.wg1337.regtrail.ui.screen.settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -23,6 +25,29 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import io.github.wg1337.regtrail.ui.agent.AgentConfigUi
 
+/** Chinese labels for `ThinkingLevel`'s enum names. */
+private val THINKING_LABELS = mapOf(
+    "Off" to "关闭",
+    "Low" to "低",
+    "High" to "高",
+    "Max" to "最高",
+)
+
+/** One sentence per level, kept next to the labels so they cannot drift. */
+private val THINKING_HINTS = mapOf(
+    "Off" to "不思考直接回答：最快最省，复杂分析容易漏线索。",
+    "Low" to "少量思考（reasoning_effort=low）：适合明确的单步问题。",
+    "High" to "默认档（reasoning_effort=high）：先思考再回答，适合定位类/字段。",
+    "Max" to "思考最充分（reasoning_effort=max）：最慢最贵，适合多步排查。",
+)
+
+/** Chinese labels for `ThinkingWire`'s enum names. */
+private val WIRE_LABELS = mapOf(
+    "Auto" to "自动",
+    "Always" to "始终发送",
+    "Never" to "从不发送",
+)
+
 /**
  * Agent model configuration, moved off the chat screen.
  *
@@ -41,7 +66,14 @@ import io.github.wg1337.regtrail.ui.agent.AgentConfigUi
 @Composable
 fun AgentSettingsScreen(
     config: AgentConfigUi,
-    onSave: (baseUrl: String, apiKey: String, model: String, rounds: Int) -> Unit,
+    onSave: (
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        rounds: Int,
+        thinking: String,
+        thinkingWire: String,
+    ) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -49,6 +81,8 @@ fun AgentSettingsScreen(
     var apiKey by remember { mutableStateOf("") }
     var model by remember(config.model) { mutableStateOf(config.model) }
     var rounds by remember(config.maxToolRounds) { mutableIntStateOf(config.maxToolRounds) }
+    var thinking by remember(config.thinking) { mutableStateOf(config.thinking) }
+    var thinkingWire by remember(config.thinkingWire) { mutableStateOf(config.thinkingWire) }
 
     Column(
         modifier = modifier
@@ -128,9 +162,63 @@ fun AgentSettingsScreen(
             }
         }
 
+        // ---- 思考等级 ------------------------------------------------------
+        //
+        // The two controls mirror the DeepSeek API's own two parameters, and the
+        // labels say so, because "思考等级" alone would leave the user guessing
+        // whether it costs extra or whether it changes the request at all.
+        SettingsCard(
+            title = "思考等级",
+            description = "DeepSeek 思考模式：模型先输出 reasoning_content 再回答。" +
+                "等级对应请求里的 reasoning_effort（low / high / max）；关闭则发送 " +
+                "thinking.type=disabled。",
+        ) {
+            val levels = listOf("Off", "Low", "High", "Max")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                levels.forEach { level ->
+                    FilterChip(
+                        selected = thinking == level,
+                        onClick = { thinking = level },
+                        label = { Text(THINKING_LABELS[level] ?: level) },
+                    )
+                }
+            }
+            Text(
+                THINKING_HINTS[thinking] ?: "",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "思考模式下 temperature 不生效（接口会忽略它），所以开启时不再发送该参数。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(Modifier.height(4.dp))
+            Text("是否发送这两个字段", style = MaterialTheme.typography.titleSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("Auto", "Always", "Never").forEach { mode ->
+                    FilterChip(
+                        selected = thinkingWire == mode,
+                        onClick = { thinkingWire = mode },
+                        label = { Text(WIRE_LABELS[mode] ?: mode) },
+                    )
+                }
+            }
+            Text(
+                when (thinkingWire) {
+                    "Always" -> "总是发送：适用于自建的 DeepSeek 兼容网关"
+                    "Never" -> "从不发送：官方 OpenAI 等不认识 thinking 字段的接口用这个"
+                    else -> "自动：Base URL 含 deepseek 时发送，其它接口原样请求"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
         Button(
             onClick = {
-                onSave(baseUrl.trim(), apiKey.trim(), model.trim(), rounds)
+                onSave(baseUrl.trim(), apiKey.trim(), model.trim(), rounds, thinking, thinkingWire)
                 // Clear the field: the key is now stored, and leaving it on screen
                 // would re-send the same secret on the next edit.
                 apiKey = ""

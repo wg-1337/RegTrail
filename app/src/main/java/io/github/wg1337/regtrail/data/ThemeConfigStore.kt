@@ -4,6 +4,8 @@ import android.content.Context
 import io.github.wg1337.regtrail.agent.AgentConfig
 import io.github.wg1337.regtrail.shared.model.OverlayMechanism
 import io.github.wg1337.regtrail.shared.model.ThemeConfig
+import io.github.wg1337.regtrail.shared.model.ThinkingLevel
+import io.github.wg1337.regtrail.shared.model.ThinkingWire
 import io.github.wg1337.regtrail.ui.state.AppSettings
 import io.github.wg1337.regtrail.ui.state.HookMode
 import io.github.wg1337.regtrail.ui.terminal.TerminalMode
@@ -183,6 +185,12 @@ class ThemeConfigStore(context: Context) {
             apiKey = key,
             model = model,
             maxToolRounds = rounds.coerceIn(1, 30),
+            // Absent keys read as the documented defaults: thinking on at `high`,
+            // and the "send the fields only to a deepseek endpoint" rule. That is
+            // what makes an install from before 思考等级 existed behave exactly
+            // as it did, without a migration step.
+            thinking = ThinkingLevel.fromWire(prefs.getString(KEY_AGENT_THINKING, null)),
+            thinkingWire = ThinkingWire.fromWire(prefs.getString(KEY_AGENT_THINKING_WIRE, null)),
         )
     }
 
@@ -192,6 +200,8 @@ class ThemeConfigStore(context: Context) {
                 putString(KEY_AGENT_BASE_URL, config.baseUrl)
                 putString(KEY_AGENT_MODEL, config.model)
                 putInt(KEY_AGENT_ROUNDS, config.maxToolRounds)
+                putString(KEY_AGENT_THINKING, config.thinking.wire)
+                putString(KEY_AGENT_THINKING_WIRE, config.thinkingWire.wire)
                 // null means "leave the stored key alone".
                 if (newApiKey != null) putString(KEY_AGENT_API_KEY, newApiKey)
             }.apply()
@@ -213,6 +223,11 @@ class ThemeConfigStore(context: Context) {
                 remove(KEY_AGENT_API_KEY)
                 remove(KEY_AGENT_MODEL)
                 remove(KEY_AGENT_ROUNDS)
+                // 思考等级 is part of the Agent configuration, so the full reset
+                // returns it to the default rather than keeping a level the user
+                // set for an endpoint they just forgot.
+                remove(KEY_AGENT_THINKING)
+                remove(KEY_AGENT_THINKING_WIRE)
             }.apply()
         }
     }
@@ -227,6 +242,8 @@ class ThemeConfigStore(context: Context) {
         const val KEY_AGENT_API_KEY = "agent_api_key_v1"
         const val KEY_AGENT_MODEL = "agent_model_v1"
         const val KEY_AGENT_ROUNDS = "agent_rounds_v1"
+        const val KEY_AGENT_THINKING = "agent_thinking_v1"
+        const val KEY_AGENT_THINKING_WIRE = "agent_thinking_wire_v1"
 
         // Behavioural settings. One key per value, so a missing key reads as the
         // default instead of invalidating a whole JSON blob.

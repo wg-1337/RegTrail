@@ -3,11 +3,12 @@ package io.github.wg1337.regtrail.xposed.overlay
 import android.app.Activity
 import android.app.Application
 import android.content.Context
+import android.graphics.Rect
 import android.os.Bundle
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import io.github.libxposed.api.XposedModule
-import io.github.wg1337.regtrail.shared.model.OverlaySizeLimits
 import io.github.wg1337.regtrail.xposed.RegTrailLog
 import io.github.wg1337.regtrail.xposed.debug.ActivityTracker
 
@@ -28,30 +29,68 @@ import io.github.wg1337.regtrail.xposed.debug.ActivityTracker
  * re-attach on every Activity that resumes. No permission, no framework internals,
  * nothing to bypass.
  *
+ * ## Why the geometry is not this class's state (the Activity-switch regression)
+ * The container is thrown away and rebuilt on every navigation, so the *view* must
+ * not be the source of truth for anything. The old implementation kept the panel
+ * position in fields here and **wrote the clamped margins back into them**:
+ *
+ * ```
+ * clampIntoContainer(): marginTopPx = clampedTop; marginEndPx = clampedEnd
+ * ```
+ *
+ * Measured on the test device, that is precisely the reported bug. Two Activities
+ * of the same app have different `android.R.id.content` rectangles (a status bar,
+ * an ActionBar, a fullscreen homework page), so the clamp against the *new*
+ * container shortened the remembered offset, and returning to the first Activity
+ * did not restore it — the panel walked up the screen one navigation at a time.
+ * The same overwrite made a collapse/expand cycle move the panel, because
+ * expanding grows a pill-sized window into a panel-sized one and re-clamped
+ * against the pill's position.
+ *
+ * The fix is a strict separation, and it is the invariant of this class:
+ *
+ *  - **[PanelGeometry] is the intent.** Owned by [OverlayController], persisted by
+ *    [OverlaySizeStore], never modified by a clamp. Every attach starts from it.
+ *  - **[PanelPlacement] is derived.** Recomputed from the intent against the
+ *    current container whenever one is needed, and thrown away.
+ *
+ * So a position that does not fit the current Activity is clamped *for display
+ * only*, and leaving that Activity restores the user's position exactly. A drag is
+ * the only thing that changes the intent.
+ *
+ * ## Re-applying after layout
+ * The container has no bounds when it is added, and the previous implementation
+ * clamped once from a `post {}` whose `view.width` could still be the *old
+ * Activity's* width. Here a layout listener on the container refreshes the cached
+ * screen rectangle and re-applies, so every clamp is computed against the real,
+ * measured parent — and again on any later change (rotation, IME, insets, a
+ * split-screen resize), which is the other half of "the window changed by itself".
+ *
  * ## What you give up
  * - The window sits *inside* the Activity window, so it is clipped by the system
  *   bars and hidden behind dialogs rather than floating above them.
- * - It is torn down and rebuilt as Activities change, so the *view* must not be
- *   the source of truth for anything. The only state this class carries is the
- *   panel size and its position, and both are re-applied to every freshly
- *   attached view — which is why a drag survives an Activity change. The persisted
- *   copy of the size lives outside the process (see `OverlaySizeStore`).
+ * - It is torn down and rebuilt as Activities change, so the panel must be
+ *   rebuildable from [PanelGeometry] alone — which is what it now is.
  *
  * That trade is stated in the UI so the user understands which mechanism is live.
  */
 internal class DecorOverlayFallback(
-    private val module: XposedModule,
     private val assets: ModuleAssets,
     /**
-     * Expanded panel size in dp the first time an Activity is decorated.
-     *
-     * Resolved by [OverlayController] *before* the mechanism is chosen (from the
-     * published default, overriding it with a remembered drag), so the two
-     * mechanisms open at the same size. It is kept up to date afterwards by
-     * [resizeTo].
+     * The current intent. Read on every apply rather than copied, so there is
+     * exactly one source of truth and a re-attach can never invent a default.
      */
-    private var panelSizeDp: Pair<Int, Int> = OverlaySizeLimits.DEFAULT_WIDTH_DP to
-        OverlaySizeLimits.DEFAULT_HEIGHT_DP,
+    private val geometry: () -> PanelGeometry,
+    /**
+     * Reports a geometry the **user** decided (a drag, or the first default being
+     * locked in).
+     *
+     * @param persist true only for the last frame of a gesture: the frames in
+     *   between must not each write a preference file.
+     */
+    private val onGeometryChanged: (PanelGeometry, Boolean) -> Unit,
+    /** Restored from [OverlaySizeStore] so collapsing survives a re-attach. */
+    initialCollapsed: Boolean = false,
 ) {
 
     private var currentContainer: FrameLayout? = null
@@ -59,17 +98,12 @@ internal class DecorOverlayFallback(
     private var registered = false
 
     /**
-     * Margins a previous run dragged the panel to, in pixels.
+     * Mirrors `FloatingOverlayView.isCollapsed`; decides which size to apply.
      *
-     * Consumed once, on the first attach; [OverlayController] reads them from
-     * `OverlaySizeStore` so a dragged position survives the target process being
-     * killed. They are clamped to the container as soon as it has been laid out —
-     * a value saved on a larger screen must never leave the panel unreachable.
+     * Volatile because the bridge thread reads it through [applyCollapsedSize].
      */
-    private var restoredMargins: Pair<Int, Int>? = null
-
-    /** Mirrors [FloatingOverlayView.isCollapsed]; decides which size to apply. */
-    private var collapsed = false
+    @Volatile
+    private var collapsed = initialCollapsed
 
     /**
      * True after an explicit 「隐藏窗口」.
@@ -81,29 +115,48 @@ internal class DecorOverlayFallback(
      */
     private var hidden = false
 
-    /**
-     * Position of the panel inside the container, in pixels.
-     *
-     * The container is `MATCH_PARENT`, so "moving the window" here means moving
-     * the *child* inside it — i.e. these two margins. They deliberately survive
-     * `detach()`, so the window stays where the user dragged it when the next
-     * Activity attaches a fresh view.
-     */
-    private var marginTopPx = -1
-    private var marginEndPx = -1
-
     /** The activity the overlay is currently attached to. */
     private var hostActivity: Activity? = null
 
     /**
-     * Margin pair (top, end) at the moment a header drag started.
+     * The container's bounds **in screen pixels**, cached from its last layout.
      *
-     * Kept here rather than in the controller because only this class knows how a
-     * position maps onto `FrameLayout` margins (the panel is laid out with
-     * `Gravity.TOP or Gravity.END`, so moving right *decreases* `marginEnd`).
+     * Deliberately not cleared by [detach]: the previous Activity's content
+     * rectangle is a far better guess for the provisional placement of the next
+     * one than the whole display is, and it is replaced by the real rectangle in
+     * the first layout pass anyway.
      */
-    private var dragOriginTopPx = 0
-    private var dragOriginEndPx = 0
+    private var containerRect: Rect? = null
+
+    /**
+     * The display density, resolved once per attached Activity.
+     *
+     * [PanelLayoutMath.density] has to ask the display service, which is a binder
+     * round trip — fine once per attach, wasteful once per drag frame. It can only
+     * change with a configuration change, and that recreates the Activity, so a
+     * per-attach cache is exact.
+     */
+    @Volatile
+    private var cachedDensity: Float? = null
+
+    /**
+     * The placement last written into the `LayoutParams` — what the user sees, and
+     * therefore the origin a pill drag has to start from.
+     *
+     * Volatile because the JS bridge thread reads it in [dragToDp].
+     */
+    @Volatile
+    private var placement: PanelPlacement? = null
+
+    /**
+     * Placement at the moment a header drag started.
+     *
+     * The page sends the **total** delta since the finger went down, so this is
+     * what keeps the maths idempotent: asking for 500 dp twice produces the same
+     * answer as asking once, and a dropped or reordered frame cannot drift.
+     */
+    @Volatile
+    private var dragOrigin: PanelPlacement? = null
 
     @Volatile
     private var onMessage: ((String, String) -> String?)? = null
@@ -122,13 +175,9 @@ internal class DecorOverlayFallback(
         app: Application,
         handler: (String, String) -> String?,
         onCollapsed: (Boolean) -> Unit = {},
-        savedMargins: Pair<Int, Int>? = null,
     ) {
         onMessage = handler
         onCollapsedToggle = onCollapsed
-        if (savedMargins != null && marginTopPx < 0) {
-            restoredMargins = savedMargins
-        }
         if (registered) return
         registered = true
 
@@ -181,7 +230,10 @@ internal class DecorOverlayFallback(
             }
         })
 
-        RegTrailLog.i("decor overlay fallback installed (no permission, no system_server hook)")
+        RegTrailLog.i(
+            "decor overlay fallback installed " +
+                "(collapsed=$collapsed, intent=${geometry().describe()})",
+        )
     }
 
     private fun attach(activity: Activity) {
@@ -219,31 +271,20 @@ internal class DecorOverlayFallback(
             },
         )
         view.onDrag = { dx, dy -> moveBy(dx, dy) }
+        // Persist the *end* of a pill drag: the frames in between must not write a
+        // preference file each, and without this the pill position was the one
+        // piece of state that still died with the target process.
+        view.onDragEnd = { persistIntent() }
+        // Restore the collapsed state before the first apply, so the very first
+        // layout is already pill-sized: a fresh view always starts expanded, and
+        // an Activity change while collapsed used to pop the panel open for a
+        // frame (and re-clamp against the panel size).
+        view.setCollapsed(collapsed)
 
-        // Keep the overlay in the top-right corner, which is where it is least
-        // likely to cover primary content. The size comes from the controller so
-        // a remembered drag (or the settings app's slider) is honoured on every
-        // re-attach, not just on the first one.
-        if (marginTopPx < 0) {
-            val restored = restoredMargins
-            marginTopPx = restored?.first ?: dp(context, MARGIN_TOP_DP)
-        }
-        if (marginEndPx < 0) {
-            val restored = restoredMargins
-            marginEndPx = restored?.second ?: dp(context, MARGIN_END_DP)
-        }
-        restoredMargins = null
-
-        val params = FrameLayout.LayoutParams(
-            dp(context, sizeDp().first.toFloat()),
-            dp(context, sizeDp().second.toFloat()),
-        ).apply {
-            gravity = android.view.Gravity.TOP or android.view.Gravity.END
-            topMargin = marginTopPx
-            marginEnd = marginEndPx
-        }
-
-        container.addView(view, params)
+        container.addView(
+            view,
+            FrameLayout.LayoutParams(0, 0).apply { gravity = GRAVITY },
+        )
         root.addView(container)
 
         // Belt and braces: if the Activity added content in the same frame, make
@@ -252,21 +293,25 @@ internal class DecorOverlayFallback(
 
         currentContainer = container
         currentView = view
+        placement = null
+        dragOrigin = null
+        // A new Activity may report a different *Resources* density; the display's
+        // is re-read once here so every frame of the coming drags is cheap.
+        cachedDensity = null
 
-        // A position restored from preferences — or simply a rotation since it was
-        // saved — may put the panel outside the new container. Clamp once the
-        // container has real bounds, otherwise the window could end up somewhere
-        // the user cannot reach (this mechanism has no other entry point).
-        container.post { clampIntoContainer() }
+        // Provisional: the real rectangle arrives with the first layout pass,
+        // which the listener below handles. Applying now means the panel never
+        // appears at 0,0 for a frame.
+        applyGeometry()
 
-        // A freshly built view starts expanded. Restore the collapsed state so an
-        // Activity change while collapsed does not pop the panel open inside a
-        // pill-sized window (the size below is already the pill size).
-        if (collapsed) view.setCollapsed(true)
+        container.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            containerRect = screenRect(v) ?: return@addOnLayoutChangeListener
+            applyGeometry()
+        }
 
         RegTrailLog.d(
             "decor overlay attached to ${activity.javaClass.name} " +
-                "container=${container.width}x${container.height}",
+                "intent=${geometry().describe()}",
         )
 
         // Push state; the Activity may be the second or third one this process
@@ -280,6 +325,8 @@ internal class DecorOverlayFallback(
         currentView?.destroy()
         currentContainer = null
         currentView = null
+        placement = null
+        dragOrigin = null
     }
 
     /** Pushes a config snapshot into the live view, if any. */
@@ -291,37 +338,229 @@ internal class DecorOverlayFallback(
         currentView?.appendLog(line)
     }
 
+    // -----------------------------------------------------------------------
+    // Geometry — the one place size and position become LayoutParams
+    // -----------------------------------------------------------------------
+
     /**
-     * The size the panel should occupy, in dp.
+     * Re-applies the intent to the live view.
      *
-     * Collapsing is a *size* change here, not merely hiding the WebView: the
-     * container is `MATCH_PARENT`, so leaving a 300x380 dp child behind would keep
-     * a large — if invisible — touch target over the host app.
+     * Called by [OverlayController] after it changed the size (the grip, the
+     * settings app's sliders) or the collapsed state, and by the layout listener
+     * whenever the container's on-screen rectangle changed. Idempotent: an apply
+     * that would not change anything writes nothing.
      */
-    private fun sizeDp(): Pair<Int, Int> = if (collapsed) {
+    fun refresh() {
+        applyGeometry()
+    }
+
+    /**
+     * Computes the placement this intent has inside the current container and
+     * writes it to the view.
+     *
+     * **Must never modify the intent** — that is the whole fix (see the class
+     * KDoc). The only exception is the very first default, which has to be turned
+     * into an absolute position once, otherwise the next Activity would re-derive
+     * it from a different content rectangle and the panel would jump by exactly
+     * the difference between the two rectangles.
+     */
+    private fun applyGeometry() {
+        val view = currentView ?: return
+        val context = view.context
+        val d = density(context)
+        val intent = geometry()
+        val size = appliedSizeDp(intent)
+        val widthPx = PanelLayoutMath.px(size.first, d)
+        val heightPx = PanelLayoutMath.px(size.second, d)
+        val displayWidthPx = PanelLayoutMath.displayWidthPx(context)
+        val area = containerRect
+            ?: currentContainer?.let { screenRect(it) }
+            ?: PanelLayoutMath.displayRect(context)
+
+        val next = PanelLayoutMath.place(
+            geometry = intent,
+            widthPx = widthPx,
+            heightPx = heightPx,
+            container = area,
+            displayWidthPx = displayWidthPx,
+            density = d,
+        )
+        placement = next
+        writeLayoutParams(view, next)
+
+        if (intent.placed || containerRect == null) return
+
+        // First ever placement: lock the default in, then re-derive from it so that
+        // what is on screen is exactly what a re-attach reproduces.
+        commitPlacement(next, persist = true)
+        val settled = PanelLayoutMath.place(
+            geometry = geometry(),
+            widthPx = widthPx,
+            heightPx = heightPx,
+            container = area,
+            displayWidthPx = displayWidthPx,
+            density = d,
+        )
+        placement = settled
+        writeLayoutParams(view, settled)
+        logPlacement("default locked", settled)
+    }
+
+    /** The panel size to apply right now: the pill while collapsed, else the intent. */
+    private fun appliedSizeDp(intent: PanelGeometry): Pair<Int, Int> = if (collapsed) {
         FloatingOverlayView.COLLAPSED_WIDTH_DP.toInt() to
             FloatingOverlayView.COLLAPSED_HEIGHT_DP.toInt()
     } else {
-        panelSizeDp
+        intent.sizeDp
     }
 
     /**
-     * Applies a size chosen by the user to the live view.
+     * Writes [next] into the view's `LayoutParams`; silent when nothing changed.
      *
-     * The controller has already clamped it to [OverlaySizeLimits], so this only
-     * converts dp → px. Recorded even when nothing is attached, because the next
-     * Activity must open at the new size.
+     * Logs only when the **size** changed (or on the very first write of a fresh
+     * view), because a drag changes only the position and would otherwise emit one
+     * line — and one spool-file append — per animation frame. The end of a gesture
+     * is logged by [persistIntent], so a drag still leaves exactly one line with its
+     * final numbers.
      */
-    fun resizeTo(widthDp: Int, heightDp: Int) {
-        panelSizeDp = widthDp to heightDp
-        if (!collapsed) applySize()
+    private fun writeLayoutParams(view: FloatingOverlayView, next: PanelPlacement) {
+        val existing = view.layoutParams as? FrameLayout.LayoutParams
+        val sizeChanged = existing == null ||
+            existing.width != next.widthPx ||
+            existing.height != next.heightPx
+        if (!sizeChanged &&
+            existing != null &&
+            existing.topMargin == next.marginTopPx &&
+            existing.marginEnd == next.marginEndPx &&
+            existing.gravity == GRAVITY
+        ) {
+            return
+        }
+
+        val params = existing ?: FrameLayout.LayoutParams(next.widthPx, next.heightPx)
+        params.width = next.widthPx
+        params.height = next.heightPx
+        params.topMargin = next.marginTopPx
+        params.marginEnd = next.marginEndPx
+        params.gravity = GRAVITY
+        view.layoutParams = params
+
+        if (sizeChanged) logPlacement("sized", next)
     }
 
-    /** Switches the panel to/from the collapsed pill. */
+    /** One line of geometry, in the units a screenshot can be compared against. */
+    private fun logPlacement(reason: String, next: PanelPlacement) {
+        RegTrailLog.d(
+            "decor overlay $reason ${next.widthPx}x${next.heightPx}px " +
+                "at(${next.leftPx},${next.topPx}) " +
+                "margins(top=${next.marginTopPx},end=${next.marginEndPx}) " +
+                "endGap=${next.endGapPx} collapsed=$collapsed " +
+                "intent=${geometry().describe()} " +
+                "container=${describeRect(containerRect)} " +
+                "activity=${hostActivity?.javaClass?.simpleName}",
+        )
+    }
+
+    /**
+     * Turns the placement that is on screen back into an intent.
+     *
+     * No unit conversion: the intent's position is in screen pixels for the reason
+     * [PanelGeometry] documents — dp is not a stable unit across the Activities of
+     * one app on this device, so a dp position would move the panel by the ratio of
+     * two densities the moment the user navigates.
+     */
+    private fun commitPlacement(next: PanelPlacement, persist: Boolean) {
+        onGeometryChanged(
+            geometry().placedAt(topPx = next.topPx, endPx = next.endGapPx),
+            persist,
+        )
+    }
+
+    /**
+     * The placement a drag of ([dxPx], [dyPx]) *from* [origin] may reach.
+     *
+     * Increasing `dx` moves the panel right (which *decreases* the gap to the right
+     * edge); increasing `dy` moves it down. The result is clamped so the panel
+     * stays inside the container — this mechanism has no other entry point, so a
+     * panel dragged out of reach could never be recovered.
+     */
+    private fun clampedTarget(
+        origin: PanelPlacement,
+        dxPx: Int,
+        dyPx: Int,
+    ): PanelPlacement? {
+        val view = currentView ?: return null
+        val area = containerRect ?: return null
+        val displayWidthPx = PanelLayoutMath.displayWidthPx(view.context)
+
+        val minTop = area.top
+        val maxTop = (area.bottom - origin.heightPx).coerceAtLeast(minTop)
+        // `endGap` is measured from the display's right edge, while the clamp is
+        // against the container's edges; a container that is inset from the display
+        // (a nav bar) shifts the window the gap may live in.
+        val minEnd = displayWidthPx - area.right
+        val maxEnd = (displayWidthPx - area.left - origin.widthPx).coerceAtLeast(minEnd)
+
+        val top = (origin.topPx + dyPx).coerceIn(minTop, maxTop)
+        val end = (origin.endGapPx - dxPx).coerceIn(minEnd, maxEnd)
+        return PanelPlacement(
+            widthPx = origin.widthPx,
+            heightPx = origin.heightPx,
+            leftPx = displayWidthPx - end - origin.widthPx,
+            topPx = top,
+            endGapPx = end,
+            marginTopPx = top - area.top,
+            marginEndPx = area.right - (displayWidthPx - end),
+        )
+    }
+
+    /**
+     * Moves the panel inside the container by ([dx], [dy]) screen pixels.
+     *
+     * Driven by the collapsed pill, whose touch listener reports per-frame deltas
+     * from `MotionEvent.rawX/rawY` — i.e. already in screen pixels, the same space
+     * the intent lives in.
+     */
+    private fun moveBy(dx: Int, dy: Int) {
+        val origin = placement ?: return
+        val target = clampedTarget(origin, dx, dy) ?: return
+        commitPlacement(target, persist = false)
+        applyGeometry()
+    }
+
+    /** Persists the intent the in-memory drags have already produced. */
+    private fun persistIntent() {
+        placement?.let { logPlacement("gesture committed", it) }
+        onGeometryChanged(geometry(), true)
+    }
+
+    /**
+     * Persists the current position now.
+     *
+     * Called by [OverlayController] when the page reports the last frame of a
+     * header drag: the per-frame messages only move the panel, exactly like the
+     * resize grip, so one gesture costs one preference write.
+     */
+    fun persistPlacement() {
+        persistIntent()
+    }
+
+    // -----------------------------------------------------------------------
+    // Collapsed state
+    // -----------------------------------------------------------------------
+
+    /** Switches the panel to/from the collapsed pill and re-applies its size. */
     fun setCollapsed(value: Boolean) {
+        if (collapsed == value) {
+            // Still re-apply: the caller may be re-asserting the state after a
+            // re-attach, and the fresh view has to be sized for it either way.
+            currentView?.setCollapsed(value)
+            applyGeometry()
+            return
+        }
         collapsed = value
         currentView?.setCollapsed(value)
-        applySize()
+        applyGeometry()
     }
 
     val isCollapsed: Boolean get() = collapsed
@@ -343,52 +582,6 @@ internal class DecorOverlayFallback(
         attach(activity)
     }
 
-    private fun applySize() {
-        val view = currentView ?: return
-        val context = view.context
-        val size = sizeDp()
-        val lp = view.layoutParams as? FrameLayout.LayoutParams ?: return
-        lp.width = dp(context, size.first.toFloat())
-        lp.height = dp(context, size.second.toFloat())
-        view.layoutParams = lp
-        // Growing from the pill back to the panel is a *size* change, and the position
-        // was clamped against the pill's size while collapsed. A panel dragged near a
-        // container edge would therefore expand half outside the Activity window —
-        // measured on the test device: the title bar's first inch and the 状态 tab were
-        // clipped away. Re-clamp once this new size has been laid out.
-        view.post { clampIntoContainer() }
-    }
-
-    /**
-     * Moves the panel inside the container by ([dx], [dy]) pixels.
-     *
-     * Clamped to the container so a drag can never push the window off-screen
-     * where it could no longer be grabbed — the same failure mode that makes a
-     * mis-sized panel unrecoverable.
-     */
-    private fun moveBy(dx: Int, dy: Int) {
-        val view = currentView ?: return
-        val lp = view.layoutParams as? FrameLayout.LayoutParams ?: return
-
-        val containerWidth = currentContainer?.width ?: 0
-        val containerHeight = currentContainer?.height ?: 0
-
-        // Gravity is TOP|END, so a rightward drag *decreases* `marginEnd`.
-        val maxEnd = ((containerWidth - view.width).coerceAtLeast(0))
-        val maxTop = ((containerHeight - view.height).coerceAtLeast(0))
-
-        marginEndPx = (marginEndPx - dx).let {
-            if (containerWidth > 0) it.coerceIn(0, maxEnd) else it.coerceAtLeast(0)
-        }
-        marginTopPx = (marginTopPx + dy).let {
-            if (containerHeight > 0) it.coerceIn(0, maxTop) else it.coerceAtLeast(0)
-        }
-
-        lp.topMargin = marginTopPx
-        lp.marginEnd = marginEndPx
-        view.layoutParams = lp
-    }
-
     // -----------------------------------------------------------------------
     // Header drag (the expanded panel's title bar)
     // -----------------------------------------------------------------------
@@ -397,14 +590,10 @@ internal class DecorOverlayFallback(
      * Remembers the current position as the origin of a header drag.
      *
      * Called once per gesture from the controller, so the frame-by-frame path
-     * ([dragToDp]) is pure arithmetic: the page sends the *total* delta since the
-     * finger went down, and this class turns it into an absolute margin pair. That
-     * is what makes clamping idempotent — asking for 500 dp twice gives the same
-     * answer as asking once, so a dropped or reordered frame cannot drift.
+     * ([dragToDp]) is pure arithmetic against a fixed origin.
      */
     fun beginDrag() {
-        dragOriginTopPx = marginTopPx
-        dragOriginEndPx = marginEndPx
+        dragOrigin = placement
     }
 
     /**
@@ -416,104 +605,85 @@ internal class DecorOverlayFallback(
      */
     fun dragBoundsDp(): IntArray {
         val view = currentView ?: return intArrayOf(0, 0, 0, 0)
-        val context = view.context
-        val containerWidth = currentContainer?.width ?: 0
-        val containerHeight = currentContainer?.height ?: 0
-        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+        val area = containerRect ?: return intArrayOf(0, 0, 0, 0)
+        val origin = dragOrigin ?: placement ?: return intArrayOf(0, 0, 0, 0)
+        val d = density(view.context)
+        val displayWidthPx = PanelLayoutMath.displayWidthPx(view.context)
 
-        val maxEnd = ((containerWidth - view.width).coerceAtLeast(0))
-        val maxTop = ((containerHeight - view.height).coerceAtLeast(0))
+        val minTop = area.top
+        val maxTop = (area.bottom - origin.heightPx).coerceAtLeast(minTop)
+        val minEnd = displayWidthPx - area.right
+        val maxEnd = (displayWidthPx - area.left - origin.widthPx).coerceAtLeast(minEnd)
 
-        // Rightward: marginEnd may fall to 0, i.e. dx <= dragOriginEndPx.
-        // Leftward: marginEnd may grow to maxEnd, i.e. dx >= dragOriginEndPx - maxEnd.
-        val maxDx = (dragOriginEndPx / density).toInt()
-        val minDx = ((dragOriginEndPx - maxEnd) / density).toInt()
-        // Downward: marginTop may grow to maxTop.
-        val maxDy = ((maxTop - dragOriginTopPx) / density).toInt()
-        val minDy = (-dragOriginTopPx / density).toInt()
+        val maxDx = PanelLayoutMath.dpOf(origin.endGapPx - minEnd, d)
+        val minDx = PanelLayoutMath.dpOf(origin.endGapPx - maxEnd, d)
+        val maxDy = PanelLayoutMath.dpOf(maxTop - origin.topPx, d)
+        val minDy = PanelLayoutMath.dpOf(minTop - origin.topPx, d)
         return intArrayOf(minDx, maxDx, minDy, maxDy)
     }
 
     /**
      * Applies a header-drag delta in dp; returns the delta that was really applied.
      *
-     * Runs the layout work on the main thread (a `layoutParams` write off the UI
-     * thread is undefined behaviour) but answers *immediately* with the clamped
-     * value, because the clamp is deterministic: the page's local transform only
-     * needs to know where the panel is going to be, not whether it has been laid
-     * out yet.
+     * Runs on the **JS bridge thread** (a `@JavascriptInterface` call), so the
+     * intent update is done inline — it is thread-safe state, and the reply has to
+     * be immediate — while the `LayoutParams` write is handed to the view's own
+     * thread. The reply is already correct because the clamp above is
+     * deterministic: the page's local transform only needs to know where the panel
+     * is going to be, not whether it has been laid out yet.
      */
     fun dragToDp(dxDp: Int, dyDp: Int): Pair<Int, Int> {
         val view = currentView ?: return 0 to 0
-        val context = view.context
-        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
-        val containerWidth = currentContainer?.width ?: 0
-        val containerHeight = currentContainer?.height ?: 0
-        val maxEnd = ((containerWidth - view.width).coerceAtLeast(0))
-        val maxTop = ((containerHeight - view.height).coerceAtLeast(0))
+        val origin = dragOrigin ?: return 0 to 0
+        val d = density(view.context)
 
-        val targetEnd = (dragOriginEndPx - (dxDp * density).toInt()).let {
-            if (containerWidth > 0) it.coerceIn(0, maxEnd) else it.coerceAtLeast(0)
-        }
-        val targetTop = (dragOriginTopPx + (dyDp * density).toInt()).let {
-            if (containerHeight > 0) it.coerceIn(0, maxTop) else it.coerceAtLeast(0)
-        }
+        val target = clampedTarget(
+            origin = origin,
+            dxPx = (dxDp * d).toInt(),
+            dyPx = (dyDp * d).toInt(),
+        ) ?: return 0 to 0
 
-        val appliedDx = ((dragOriginEndPx - targetEnd) / density).toInt()
-        val appliedDy = ((targetTop - dragOriginTopPx) / density).toInt()
+        val appliedDx = PanelLayoutMath.dpOf(origin.endGapPx - target.endGapPx, d)
+        val appliedDy = PanelLayoutMath.dpOf(target.topPx - origin.topPx, d)
 
-        // The *intent* is recorded synchronously so a release in the same frame can
-        // persist it; only the `LayoutParams` write is handed to the UI thread.
-        marginTopPx = targetTop
-        marginEndPx = targetEnd
-
-        view.post {
-            val live = currentView ?: return@post
-            val lp = live.layoutParams as? FrameLayout.LayoutParams ?: return@post
-            if (lp.topMargin == targetTop && lp.marginEnd == targetEnd) return@post
-            lp.topMargin = targetTop
-            lp.marginEnd = targetEnd
-            live.layoutParams = lp
-        }
+        commitPlacement(target, persist = false)
+        view.post { applyGeometry() }
         return appliedDx to appliedDy
     }
 
-    /** The current margin pair, in pixels, for persistence on drag release. */
-    fun marginsPx(): Pair<Int, Int> = marginTopPx to marginEndPx
-
-    /** Pulls the panel back inside the container after a restore or a rotation. */
-    private fun clampIntoContainer() {
-        val view = currentView ?: return
-        val lp = view.layoutParams as? FrameLayout.LayoutParams ?: return
-        if (view.width <= 0 || view.height <= 0) return
-        val containerWidth = currentContainer?.width ?: 0
-        val containerHeight = currentContainer?.height ?: 0
-        if (containerWidth <= 0 && containerHeight <= 0) return
-
-        val maxEnd = ((containerWidth - view.width).coerceAtLeast(0))
-        val maxTop = ((containerHeight - view.height).coerceAtLeast(0))
-        val clampedEnd = if (containerWidth > 0) marginEndPx.coerceIn(0, maxEnd) else marginEndPx
-        val clampedTop = if (containerHeight > 0) marginTopPx.coerceIn(0, maxTop) else marginTopPx
-        if (clampedEnd == marginEndPx && clampedTop == marginTopPx) return
-
-        marginEndPx = clampedEnd
-        marginTopPx = clampedTop
-        lp.topMargin = marginTopPx
-        lp.marginEnd = marginEndPx
-        view.layoutParams = lp
-        RegTrailLog.d("decor overlay margins clamped to top=$marginTopPx end=$marginEndPx")
-    }
+    /** The live placement, in screen pixels, for the 状态 diagnostics. */
+    fun placementPx(): PanelPlacement? = placement
 
     val isAttached: Boolean get() = currentView != null
 
-    private fun dp(context: Context, value: Float): Int =
-        (value * context.resources.displayMetrics.density + 0.5f).toInt()
+    /** The display density for this attach, cached (see [cachedDensity]). */
+    private fun density(context: Context): Float {
+        cachedDensity?.let { return it }
+        return PanelLayoutMath.density(context).also { cachedDensity = it }
+    }
 
     private companion object {
-        /** Distance from the top of the content area on first attach. */
-        const val MARGIN_TOP_DP = 80f
+        /**
+         * The panel is anchored to its **top-right** corner: positioning it by its
+         * end edge means expanding a pill grows it leftwards and downwards, which
+         * is the corner the user is looking at.
+         */
+        val GRAVITY: Int = Gravity.TOP or Gravity.END
 
-        /** Gap to the right edge on first attach. */
-        const val MARGIN_END_DP = 8f
+        /** The on-screen rectangle of [view], or null while it has no bounds. */
+        fun screenRect(view: View): Rect? {
+            if (view.width <= 0 || view.height <= 0) return null
+            val location = IntArray(2)
+            view.getLocationOnScreen(location)
+            return Rect(
+                location[0],
+                location[1],
+                location[0] + view.width,
+                location[1] + view.height,
+            )
+        }
+
+        fun describeRect(rect: Rect?): String =
+            if (rect == null) "none" else "${rect.left},${rect.top},${rect.right},${rect.bottom}"
     }
 }

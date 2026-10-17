@@ -1,6 +1,7 @@
 package io.github.wg1337.regtrail.agent
 
 import io.github.wg1337.regtrail.bridge.ModuleBridgeClient
+import io.github.wg1337.regtrail.data.ScriptStore
 import io.github.wg1337.regtrail.memory.MemoryException
 import io.github.wg1337.regtrail.memory.MemoryMatch
 import io.github.wg1337.regtrail.memory.MemoryScanner
@@ -10,13 +11,20 @@ import io.github.wg1337.regtrail.memory.hexBytes
 import io.github.wg1337.regtrail.memory.humanBytes
 import io.github.wg1337.regtrail.memory.parseMemoryAddress
 import io.github.wg1337.regtrail.root.RootShell
-import io.github.wg1337.regtrail.shared.bridge.BridgeApi
+import io.github.wg1337.regtrail.shared.model.ScriptAction
+import io.github.wg1337.regtrail.shared.model.ScriptSpec
+import io.github.wg1337.regtrail.shared.model.ScriptTrigger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.put
 
 /**
  * The ReAct-style loop that turns a user question into tool calls and an answer.
@@ -32,13 +40,17 @@ import kotlinx.serialization.json.contentOrNull
  * ```
  *
  * ## Where tools run
- * Three places, and the split matters:
- *  - **Class/field/hook tools** are dispatched to the *target process* through
- *    [ModuleBridgeClient], because that is the only place the objects exist.
+ * Four places, and the split matters:
+ *  - **Class/field/hook/script-execution tools** are dispatched to the *target
+ *    process* through [ModuleBridgeClient], because that is the only place the
+ *    objects exist.
  *  - **`run_shell`** runs on the *settings side* via root, because a shell inside
  *    a third-party process would be both surprising and far more fragile.
  *  - **`mem_*` memory tools** also run on the settings side, as root, against
  *    `/proc/<pid>/mem`. They do not need the module to be loaded, only a pid.
+ *  - **`script_*` library tools and `read_file`/`write_file`** run here, against
+ *    the on-disk library and the sandboxed roots: the library belongs to this
+ *    app, so the target process has no business writing it.
  *
  * The system prompt tells the model this, so it does not misread a shell result
  * as the target's own environment.
@@ -46,6 +58,19 @@ import kotlinx.serialization.json.contentOrNull
 class AgentSession(
     private val configProvider: () -> AgentConfig,
     private val bridge: ModuleBridgeClient,
+    /** The on-disk script library owned by this app. */
+    private val scripts: ScriptStore,
+    /** Sandboxed file access for `read_file` / `write_file`. */
+    private val files: FileTools,
+    /**
+     * Re-publishes `config.json` so the injected side sees the library change.
+     *
+     * A `script_create` that only wrote a file would leave the target process
+     * running the *previous* script list, which makes "created it, then ran it"
+     * fail for a reason the user cannot see. `script_run` therefore publishes
+     * first and executes second.
+     */
+    private val onScriptsChanged: suspend () -> Unit = {},
     private val onMessage: (AgentMessage) -> Unit,
 ) {
 
@@ -97,61 +122,67 @@ class AgentSession(
             }
 
             // Re-append the assistant message verbatim so the provider sees its
-            // own tool_calls array on the next round (required by the protocol).
+            // own tool_calls array on the next round (required by the protocol) —
+            // and so `reasoning_content` is echoed back, which the DeepSeek guide
+            // *requires* on every later request once `tools` is present ("若您的
+            // 代码中未正确回传 reasoning_content，API 会返回 400 报错").
             history += completion.rawMessage
 
             if (completion.toolCalls.isEmpty()) {
                 val text = completion.content.ifBlank { "（模型没有返回内容）" }
-                onMessage(AgentMessage(AgentMessage.Role.Assistant, text))
+                onMessage(
+                    AgentMessage(
+                        AgentMessage.Role.Assistant,
+                        text,
+                        reasoning = completion.reasoning.takeIf { it.isNotBlank() },
+                    ),
+                )
                 return@withContext
             }
 
-            if (completion.content.isNotBlank()) {
-                onMessage(
-                    AgentMessage(
-                        AgentMessage.Role.Assistant,
-                        completion.content,
-                        toolCalls = completion.toolCalls.map { it.name },
-                    ),
-                )
-            } else {
-                onMessage(
-                    AgentMessage(
-                        AgentMessage.Role.Assistant,
-                        "调用工具：" + completion.toolCalls.joinToString(", ") { it.name },
-                        toolCalls = completion.toolCalls.map { it.name },
-                    ),
-                )
-            }
+            // One tool-call round: run them in order, collect a *summarised* step
+            // per call, and publish the round as a single assistant message.
+            //
+            // The UI renders each step collapsed to one line. Emitting the raw
+            // arguments and the raw JSON result as separate chat messages — which
+            // is what this used to do — produced a wall of JSON that made the
+            // conversation unreadable and the actual answer hard to find.
+            val steps = ArrayList<AgentToolStep>(completion.toolCalls.size)
 
             for (call in completion.toolCalls) {
                 val tool = AgentTools.byName(call.name)
                 if (tool == null) {
-                    history += OpenAiCompatibleClient.toolResult(
-                        call.id,
-                        """{"ok":false,"error":"未知工具 ${call.name}"}""",
+                    val payload = errJson("未知工具 ${call.name}")
+                    history += OpenAiCompatibleClient.toolResult(call.id, payload)
+                    steps += AgentToolStep(
+                        name = call.name,
+                        arguments = preview(call.rawArguments),
+                        result = "未知工具",
+                        ok = false,
                     )
                     continue
                 }
 
                 toolCalls += call.name
-                onMessage(
-                    AgentMessage(
-                        AgentMessage.Role.Tool,
-                        describeCall(call),
-                    ),
-                )
-
                 val result = executeTool(tool, call.arguments)
-                onMessage(
-                    AgentMessage(
-                        AgentMessage.Role.Tool,
-                        result,
-                    ),
+                steps += AgentToolStep(
+                    name = call.name,
+                    arguments = preview(call.rawArguments),
+                    result = summarize(result),
+                    ok = !looksLikeFailure(result),
                 )
-
                 history += OpenAiCompatibleClient.toolResult(call.id, result)
             }
+
+            onMessage(
+                AgentMessage(
+                    AgentMessage.Role.Assistant,
+                    completion.content,
+                    toolCalls = steps.map { it.name },
+                    toolSteps = steps,
+                    reasoning = completion.reasoning.takeIf { it.isNotBlank() },
+                ),
+            )
         }
 
         onMessage(
@@ -169,15 +200,19 @@ class AgentSession(
     }
 
     // -----------------------------------------------------------------------
+    // Dispatch
+    // -----------------------------------------------------------------------
 
     private suspend fun executeTool(tool: AgentTool, args: JsonObject): String = try {
         when {
             tool.name == "run_shell" -> runShell(args)
             tool.name.startsWith("mem_") -> runMemoryTool(tool.name, args)
+            tool.name.startsWith("script_") -> runScriptTool(tool.name, args)
+            tool.name == "read_file" || tool.name == "write_file" -> runFileTool(tool.name, args)
             else -> runInTarget(tool.name, args)
         }
     } catch (t: Throwable) {
-        """{"ok":false,"error":${quote(t.message ?: t::class.java.simpleName)}}"""
+        errJson(t.message ?: t::class.java.simpleName)
     }
 
     /**
@@ -189,29 +224,336 @@ class AgentSession(
      */
     private suspend fun runInTarget(name: String, args: JsonObject): String {
         if (!bridge.isModuleLoaded()) {
-            return """{"ok":false,"error":"目标进程未加载模块：请先启动一个已授权作用域并勾选悬浮窗的应用"}"""
+            return errJson("目标进程未加载模块：请先启动一个已授权作用域并勾选悬浮窗的应用")
         }
         val result = bridge.tool(name, args)
         return result.fold(
             onSuccess = { data -> OpenAiCompatibleClient.summarize(data) },
-            onFailure = { error ->
-                """{"ok":false,"error":${quote(error.message ?: "工具执行失败")}}"""
-            },
+            onFailure = { error -> errJson(error.message ?: "工具执行失败") },
         )
     }
 
     /** Runs a root shell command on the settings side. */
     private suspend fun runShell(args: JsonObject): String {
-        val command = (args["command"] as? JsonPrimitive)?.content
-            ?: return """{"ok":false,"error":"缺少 command 参数"}"""
+        val command = args.strArg("command")
+            ?: return errJson("缺少 command 参数")
 
         val result = RootShell.run(command, timeoutSeconds = 25)
         return result.fold(
             onSuccess = { output ->
-                """{"ok":true,"output":${quote(output.take(MAX_SHELL_OUTPUT))}}"""
+                okJson { put("output", output.take(MAX_SHELL_OUTPUT)) }
             },
             onFailure = { error ->
-                """{"ok":false,"error":${quote(error.message ?: "命令执行失败")}}"""
+                errJson(error.message ?: "命令执行失败")
+            },
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Script library tools
+    // -----------------------------------------------------------------------
+
+    /**
+     * The `script_*` tools: the durable form of a debug session.
+     *
+     * Everything except `script_run` executes here; `script_run` republishes and
+     * then asks the *target process* to execute the script, because an action is
+     * a reflection call against that process's classes.
+     */
+    private suspend fun runScriptTool(name: String, args: JsonObject): String = when (name) {
+        "script_list" -> scriptList(args)
+        "script_get" -> scriptGet(args)
+        "script_create" -> scriptCreate(args)
+        "script_update" -> scriptUpdate(args)
+        "script_run" -> scriptRun(args)
+        "script_versions" -> scriptVersions(args)
+        "script_restore" -> scriptRestore(args)
+        else -> errJson("未知的脚本工具 $name")
+    }
+
+    private fun scriptList(args: JsonObject): String {
+        val pattern = args.strArg("pattern").orEmpty()
+        val entries = scripts.list().filter {
+            pattern.isBlank() ||
+                it.name.contains(pattern, ignoreCase = true) ||
+                it.id.contains(pattern, ignoreCase = true)
+        }
+
+        return okJson {
+            put("count", entries.size)
+            put(
+                "scripts",
+                buildJsonArray {
+                    entries.forEach { entry ->
+                        add(
+                            buildJsonObject {
+                                put("id", entry.id)
+                                put("name", entry.name)
+                                put("enabled", entry.enabled)
+                                put("trigger", entry.trigger.name)
+                                put("actions", entry.actionCount)
+                                put("versions", entry.versionCount)
+                                put("currentVersion", entry.currentVersion)
+                                put("updatedAt", entry.updatedAt)
+                                if (entry.description.isNotBlank()) {
+                                    put("description", entry.description)
+                                }
+                            },
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    private fun scriptGet(args: JsonObject): String {
+        val id = args.strArg("id") ?: return errJson("script_get 需要 id")
+        val spec = scripts.load(id) ?: return errJson("没有这个脚本：$id")
+        return okJson {
+            put("script", specToJson(spec))
+            put(
+                "versions",
+                buildJsonArray {
+                    scripts.versions(id).forEach { info ->
+                        add(
+                            buildJsonObject {
+                                put("version", info.version)
+                                put("savedAt", info.savedAt)
+                                put("actions", info.actionCount)
+                            },
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    private suspend fun scriptCreate(args: JsonObject): String {
+        val name = args.strArg("name")?.takeIf { it.isNotBlank() }
+            ?: return errJson("script_create 需要 name")
+        val actions = parseActions(args["actions"])
+        if (actions.isEmpty()) {
+            return errJson(
+                "script_create 需要至少一个 action（kind 取 Trace/SetReturn/SetArg/GetField/SetField/CallMethod）",
+            )
+        }
+
+        val spec = ScriptSpec(
+            id = "",
+            name = name,
+            enabled = args.boolArg("enabled") ?: true,
+            trigger = parseTrigger(args.strArg("trigger")),
+            triggerTarget = args.strArg("triggerTarget"),
+            triggerMethod = args.strArg("triggerMethod"),
+            actions = actions,
+            description = args.strArg("description").orEmpty(),
+        )
+
+        val saved = scripts.create(spec)
+        onScriptsChanged()
+        return okJson {
+            put("created", saved.id)
+            put("name", saved.name)
+            put("trigger", saved.trigger.name)
+            put("actions", saved.actions.size)
+            put("version", saved.version)
+            put("next", "已经下发到目标进程；用 script_run 立刻验证一次")
+        }
+    }
+
+    private suspend fun scriptUpdate(args: JsonObject): String {
+        val id = args.strArg("id") ?: return errJson("script_update 需要 id")
+        val current = scripts.load(id) ?: return errJson("没有这个脚本：$id")
+
+        // Only what was sent changes; everything else keeps its stored value, so
+        // "enable this script" is one field rather than a full re-write that
+        // could silently drop actions the model did not re-send.
+        val actions = args["actions"]?.let { parseActions(it) }
+        val updated = current.copy(
+            name = args.strArg("name") ?: current.name,
+            description = args.strArg("description") ?: current.description,
+            enabled = args.boolArg("enabled") ?: current.enabled,
+            trigger = args.strArg("trigger")?.let { parseTrigger(it) } ?: current.trigger,
+            triggerTarget = args.strArg("triggerTarget") ?: current.triggerTarget,
+            triggerMethod = args.strArg("triggerMethod") ?: current.triggerMethod,
+            actions = actions ?: current.actions,
+        )
+
+        val saved = scripts.update(id, updated)
+        onScriptsChanged()
+        return okJson {
+            put("id", saved.id)
+            put("version", saved.version)
+            put("actions", saved.actions.size)
+            put("history", scripts.versions(id).size)
+        }
+    }
+
+    private suspend fun scriptRun(args: JsonObject): String {
+        val id = args.strArg("id") ?: return errJson("script_run 需要 id")
+        val local = scripts.load(id) ?: return errJson("没有这个脚本：$id")
+
+        // Publish first: a script created or edited a second ago is only in the
+        // library, and the target process runs whatever `config.json` says.
+        onScriptsChanged()
+
+        if (!bridge.isModuleLoaded()) {
+            return errJson("目标进程未加载模块：请先启动一个已授权作用域并勾选悬浮窗的应用")
+        }
+
+        val result = bridge.tool("script_run", buildJsonObject { put("id", JsonPrimitive(id)) })
+        return result.fold(
+            onSuccess = { data ->
+                val message = data.strOrNull("result").orEmpty()
+                okJson {
+                    put("id", id)
+                    put("name", local.name)
+                    put("version", local.version)
+                    put("result", message)
+                }
+            },
+            onFailure = { error -> errJson(error.message ?: "执行失败") },
+        )
+    }
+
+    private fun scriptVersions(args: JsonObject): String {
+        val id = args.strArg("id") ?: return errJson("script_versions 需要 id")
+        val versions = scripts.versions(id)
+        if (versions.isEmpty()) return errJson("没有这个脚本：$id")
+
+        return okJson {
+            put("id", id)
+            put("count", versions.size)
+            put(
+                "versions",
+                buildJsonArray {
+                    versions.forEach { info ->
+                        add(
+                            buildJsonObject {
+                                put("version", info.version)
+                                put("savedAt", info.savedAt)
+                                put("name", info.name)
+                                put("actions", info.actionCount)
+                            },
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    private suspend fun scriptRestore(args: JsonObject): String {
+        val id = args.strArg("id") ?: return errJson("script_restore 需要 id")
+        val version = args.intArg("version")
+            ?: return errJson("script_restore 需要 version（整数，来自 script_versions）")
+
+        val saved = try {
+            scripts.restore(id, version)
+        } catch (t: Throwable) {
+            return errJson(t.message ?: "恢复失败")
+        }
+        onScriptsChanged()
+        return okJson {
+            put("id", id)
+            put("restoredFrom", version)
+            put("version", saved.version)
+            put("actions", saved.actions.size)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // File tools
+    // -----------------------------------------------------------------------
+
+    private suspend fun runFileTool(name: String, args: JsonObject): String {
+        val path = args.strArg("path") ?: return errJson("$name 需要 path")
+        return try {
+            when (name) {
+                "read_file" -> files.readFile(
+                    path = path,
+                    startLine = args.intArg("startLine"),
+                    endLine = args.intArg("endLine"),
+                )
+
+                "write_file" -> files.writeFile(
+                    path = path,
+                    content = args.strArg("content").orEmpty(),
+                    startLine = args.intArg("startLine"),
+                    endLine = args.intArg("endLine"),
+                    mode = args.strArg("mode"),
+                )
+
+                else -> errJson("未知的文件工具 $name")
+            }
+        } catch (e: FileTools.FileToolException) {
+            errJson(e.message ?: "文件操作失败")
+        } catch (e: LineRangeEdit.RangeException) {
+            errJson(e.message ?: "行范围非法")
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Script argument parsing
+    // -----------------------------------------------------------------------
+
+    /**
+     * Turns the model's `actions` array into [ScriptAction]s.
+     *
+     * Unknown `kind`s are dropped rather than guessed: a `SetReturn` that the
+     * engine reads as a `Trace` would look like it worked while changing
+     * nothing, which is the single most expensive failure mode for a script.
+     */
+    private fun parseActions(element: JsonElement?): List<ScriptAction> {
+        val array = element as? JsonArray ?: return emptyList()
+        return array.mapNotNull { item ->
+            val obj = item as? JsonObject ?: return@mapNotNull null
+            val kind = obj.strOrNull("kind")
+                ?.let { raw -> ScriptAction.Kind.entries.firstOrNull { it.name == raw } }
+                ?: return@mapNotNull null
+            ScriptAction(
+                kind = kind,
+                className = obj.strOrNull("className"),
+                memberName = obj.strOrNull("memberName"),
+                signature = obj.strOrNull("signature"),
+                value = obj.strOrNull("value"),
+                valueType = obj.strOrNull("valueType")
+                    ?.let { raw -> ScriptAction.ValueType.entries.firstOrNull { it.name == raw } }
+                    ?: ScriptAction.ValueType.Auto,
+                receiver = obj.strOrNull("receiver"),
+            )
+        }
+    }
+
+    private fun parseTrigger(raw: String?): ScriptTrigger =
+        raw?.let { text -> ScriptTrigger.entries.firstOrNull { it.name == text } }
+            ?: ScriptTrigger.Manual
+
+    /** The `ScriptSpec` shape, for `script_get`'s answer. */
+    private fun specToJson(spec: ScriptSpec): JsonObject = buildJsonObject {
+        put("id", spec.id)
+        put("name", spec.name)
+        put("enabled", spec.enabled)
+        put("trigger", spec.trigger.name)
+        spec.triggerTarget?.let { put("triggerTarget", it) }
+        spec.triggerMethod?.let { put("triggerMethod", it) }
+        put("version", spec.version)
+        if (spec.description.isNotBlank()) put("description", spec.description)
+        put(
+            "actions",
+            buildJsonArray {
+                spec.actions.forEach { action ->
+                    add(
+                        buildJsonObject {
+                            put("kind", action.kind.name)
+                            action.className?.let { put("className", it) }
+                            action.memberName?.let { put("memberName", it) }
+                            action.signature?.let { put("signature", it) }
+                            action.value?.let { put("value", it) }
+                            put("valueType", action.valueType.name)
+                            action.receiver?.let { put("receiver", it) }
+                        },
+                    )
+                }
             },
         )
     }
@@ -406,6 +748,11 @@ class AgentSession(
     private fun JsonObject.intArg(key: String): Int? =
         (this[key] as? JsonPrimitive)?.contentOrNull?.trim()?.toIntOrNull()
 
+    private fun JsonObject.boolArg(key: String): Boolean? {
+        val text = (this[key] as? JsonPrimitive)?.contentOrNull?.trim() ?: return null
+        return text == "true" || text == "1"
+    }
+
     /**
      * Addresses arrive as `0x…` strings, but a model sometimes sends them as a
      * JSON number instead; a number is decimal, a string is hex, so a bare
@@ -418,32 +765,52 @@ class AgentSession(
         return if (primitive.isString) parseMemoryAddress(text) else text.toLongOrNull()
     }
 
-    private fun describeCall(call: OpenAiCompatibleClient.ToolCall): String = buildString {
-        append("→ ").append(call.name)
-        if (call.rawArguments.isNotBlank() && call.rawArguments != "{}") {
-            append(' ').append(call.rawArguments.take(200))
+    /**
+     * A tool result, squeezed onto one line for the collapsed step row.
+     *
+     * The full text is not kept here: it is already in the transcript that goes
+     * back to the model, and duplicating a 200 KB class dump into the UI state
+     * would make every recomposition pay for it.
+     */
+    private fun summarize(result: String): String {
+        val oneLine = result.replace(WHITESPACE, " ").trim()
+        return if (oneLine.length <= SUMMARY_CHARS) {
+            oneLine
+        } else {
+            oneLine.take(SUMMARY_CHARS) + "…（共 ${result.length} 字符）"
         }
     }
 
-    /** Minimal JSON string escaping, enough for our own error payloads. */
-    private fun quote(text: String): String = buildString {
-        append('"')
-        for (ch in text) {
-            when (ch) {
-                '"' -> append("\\\"")
-                '\\' -> append("\\\\")
-                '\n' -> append("\\n")
-                '\r' -> append("\\r")
-                '\t' -> append("\\t")
-                else -> if (ch.code < 0x20) {
-                    append("\\u").append(ch.code.toString(16).padStart(4, '0'))
-                } else {
-                    append(ch)
-                }
-            }
-        }
-        append('"')
+    /** Arguments, truncated for the collapsed row (the model sent the full JSON). */
+    private fun preview(raw: String): String {
+        val oneLine = raw.replace(WHITESPACE, " ").trim()
+        return if (oneLine.length <= ARG_CHARS) oneLine else oneLine.take(ARG_CHARS) + "…"
     }
+
+    /**
+     * Best-effort failure detection for the *display* flag only.
+     *
+     * The tool results in this class are either `{"ok":false,…}` envelopes or
+     * Chinese sentences starting with 错误, so this is exact for the shapes it
+     * actually sees; a mis-detected flag only changes a colour, never behaviour.
+     */
+    private fun looksLikeFailure(result: String): Boolean {
+        val text = result.trimStart()
+        return text.startsWith("{\"ok\":false") ||
+            text.startsWith("错误") ||
+            text.contains("\"ok\":false")
+    }
+
+    private fun okJson(build: JsonObjectBuilder.() -> Unit): String =
+        buildJsonObject {
+            put("ok", true)
+            build()
+        }.toString()
+
+    private fun errJson(message: String): String = buildJsonObject {
+        put("ok", false)
+        put("error", message)
+    }.toString()
 
     private companion object {
         /** Keeps one shell result from swallowing the whole context window. */
@@ -460,5 +827,17 @@ class AgentSession(
 
         /** Matches returned when the model does not say how many it wants. */
         const val DEFAULT_MAX_RESULTS = 500
+
+        /** Width of the collapsed step summary line. */
+        const val SUMMARY_CHARS = 160
+
+        /** Width of the collapsed step's argument preview. */
+        const val ARG_CHARS = 220
+
+        val WHITESPACE = Regex("\\s+")
     }
 }
+
+/** Reads a string field out of a tool-argument object. */
+private fun JsonObject.strOrNull(key: String): String? =
+    (this[key] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }

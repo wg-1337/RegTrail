@@ -25,6 +25,8 @@ import io.github.wg1337.regtrail.ui.agent.AgentUiState
 import io.github.wg1337.regtrail.ui.debug.DebugUiState
 import io.github.wg1337.regtrail.ui.nav.Dest
 import io.github.wg1337.regtrail.ui.patch.PatchUiState
+import io.github.wg1337.regtrail.ui.script.ScriptDraftUi
+import io.github.wg1337.regtrail.ui.script.ScriptUiState
 import io.github.wg1337.regtrail.ui.screen.AgentScreen
 import io.github.wg1337.regtrail.ui.screen.DebugScreen
 import io.github.wg1337.regtrail.ui.screen.HomeScreen
@@ -36,6 +38,7 @@ import io.github.wg1337.regtrail.ui.screen.settings.AgentSettingsScreen
 import io.github.wg1337.regtrail.ui.screen.settings.AppearanceSettingsScreen
 import io.github.wg1337.regtrail.ui.screen.settings.DebugSettingsScreen
 import io.github.wg1337.regtrail.ui.screen.settings.OverlaySettingsScreen
+import io.github.wg1337.regtrail.ui.screen.settings.ScriptSettingsScreen
 import io.github.wg1337.regtrail.ui.screen.settings.SettingsScreen
 import io.github.wg1337.regtrail.ui.screen.settings.TerminalSettingsScreen
 import io.github.wg1337.regtrail.ui.state.AppSettings
@@ -138,7 +141,66 @@ interface PlatformBridge {
     fun agentState(): AgentUiState
     fun sendAgentMessage(text: String)
     fun resetAgent()
-    fun saveAgentConfig(baseUrl: String, apiKey: String, model: String, rounds: Int)
+
+    /**
+     * Persists the Agent endpoint plus the two thinking controls.
+     *
+     * [thinking] and [thinkingWire] are the `ThinkingLevel` / `ThinkingWire` enum
+     * *names*; the platform parses them leniently, so an unknown string degrades
+     * to the default instead of throwing. Passing them as strings keeps `:ui`
+     * free of the HTTP layer's types while still being one call — a second
+     * "save the thinking level" method would be a second chance to forget it.
+     */
+    fun saveAgentConfig(
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        rounds: Int,
+        thinking: String,
+        thinkingWire: String,
+    )
+
+    // ---- Script library ----------------------------------------------------
+
+    /**
+     * The script library plus the draft currently open in the editor.
+     *
+     * Like every other `*State()` accessor this is a synchronous pull over a
+     * `StateFlow`; the UI re-reads it whenever [stateRevision] changes.
+     */
+    fun scriptState(): ScriptUiState
+
+    /** Re-reads the library from disk (a full rescan, never a cache merge). */
+    fun refreshScripts()
+
+    /**
+     * Opens the editor.
+     *
+     * [startNew] wins over [id], and a null [id] means "new" as well, so the
+     * caller never has to pass a sentinel.
+     */
+    fun editScript(id: String?, startNew: Boolean)
+
+    /** Leaves the editor; the draft is dropped. */
+    fun closeScriptEditor()
+
+    /** Creates the draft, or appends a new version of it when it already exists. */
+    fun saveScript(draft: ScriptDraftUi)
+
+    fun duplicateScript(id: String)
+    fun deleteScript(id: String)
+
+    /** Restores [version] as a *new* current version; nothing is overwritten. */
+    fun restoreScriptVersion(id: String, version: Int)
+
+    /** Writes the whole library to one bundle file and reports its path. */
+    fun exportScripts()
+
+    /** Imports a bundle previously produced by [exportScripts]. */
+    fun importScripts(json: String)
+
+    /** Clears the one-line status shown above the library. */
+    fun clearScriptMessage()
 
     // ---- Persistent injection (P6) -----------------------------------------
     /**
@@ -201,6 +263,7 @@ fun RegTrailApp(
     var agentState by remember { mutableStateOf(platform.agentState()) }
     var rootState by remember { mutableStateOf(platform.rootState()) }
     var patchState by remember { mutableStateOf(platform.patchState()) }
+    var scriptState by remember { mutableStateOf(platform.scriptState()) }
     var overlayMechanism by remember { mutableStateOf(platform.overlayMechanism()) }
     var systemHookAcknowledged by remember { mutableStateOf(platform.systemHookAcknowledged()) }
     var revision by remember { mutableStateOf(platform.stateRevision()) }
@@ -213,6 +276,7 @@ fun RegTrailApp(
         agentState = platform.agentState()
         rootState = platform.rootState()
         patchState = platform.patchState()
+        scriptState = platform.scriptState()
         // Mechanism and acknowledgement are plain preferences rather than part of
         // the snapshots, so they are re-read here too; otherwise a reset would
         // leave the radio group showing the old selection.
@@ -317,6 +381,12 @@ fun RegTrailApp(
                 }
                 Dest.Agent, Dest.AgentSettings -> {
                     agentState = platform.agentState()
+                }
+                Dest.Scripts -> {
+                    // The library lives on disk and can be changed by the Agent
+                    // while this screen is closed, so entering it re-reads.
+                    platform.refreshScripts()
+                    scriptState = platform.scriptState()
                 }
                 Dest.Terminal, Dest.TerminalSettings -> {
                     terminalState = platform.terminalState()
@@ -433,6 +503,7 @@ fun RegTrailApp(
                         debugState = debugState,
                         patchState = patchState,
                         agentState = agentState,
+                        scriptState = scriptState,
                         overlayMechanism = overlayMechanism,
                         systemHookAcknowledged = systemHookAcknowledged,
                         onThemeChange = { transform ->
@@ -532,9 +603,59 @@ fun RegTrailApp(
                 composable(Dest.AgentSettings.route) {
                     AgentSettingsScreen(
                         config = agentState.config,
-                        onSave = { baseUrl, apiKey, model, rounds ->
-                            platform.saveAgentConfig(baseUrl, apiKey, model, rounds)
+                        onSave = { baseUrl, apiKey, model, rounds, thinking, thinkingWire ->
+                            platform.saveAgentConfig(
+                                baseUrl = baseUrl,
+                                apiKey = apiKey,
+                                model = model,
+                                rounds = rounds,
+                                thinking = thinking,
+                                thinkingWire = thinkingWire,
+                            )
                             agentState = platform.agentState()
+                        },
+                        onBack = { back() },
+                    )
+                }
+
+                composable(Dest.Scripts.route) {
+                    ScriptSettingsScreen(
+                        state = scriptState,
+                        onRefresh = {
+                            platform.refreshScripts()
+                            scriptState = platform.scriptState()
+                        },
+                        onEdit = { id ->
+                            platform.editScript(id, false)
+                            scriptState = platform.scriptState()
+                        },
+                        onSave = { draft ->
+                            platform.saveScript(draft)
+                            scriptState = platform.scriptState()
+                        },
+                        onCloseEditor = {
+                            platform.closeScriptEditor()
+                            scriptState = platform.scriptState()
+                        },
+                        onDuplicate = { id ->
+                            platform.duplicateScript(id)
+                            scriptState = platform.scriptState()
+                        },
+                        onDelete = { id ->
+                            platform.deleteScript(id)
+                            scriptState = platform.scriptState()
+                        },
+                        onRestore = { id, version ->
+                            platform.restoreScriptVersion(id, version)
+                            scriptState = platform.scriptState()
+                        },
+                        onExport = {
+                            platform.exportScripts()
+                            scriptState = platform.scriptState()
+                        },
+                        onImport = { json ->
+                            platform.importScripts(json)
+                            scriptState = platform.scriptState()
                         },
                         onBack = { back() },
                     )

@@ -6,6 +6,8 @@ import io.github.wg1337.regtrail.shared.bridge.SharedPaths
 import io.github.wg1337.regtrail.shared.model.ModuleConfigSnapshot
 import io.github.wg1337.regtrail.shared.model.OverlayMechanism
 import io.github.wg1337.regtrail.shared.model.OverlaySizeLimits
+import io.github.wg1337.regtrail.shared.model.ThinkingLevel
+import io.github.wg1337.regtrail.shared.model.ThinkingWire
 import io.github.wg1337.regtrail.xposed.RegTrailLog
 import java.io.File
 
@@ -106,6 +108,16 @@ internal class ModuleConfig(private val module: XposedModule) {
         val agentModel: String = "",
         val agentApiKey: String = "",
         val agentMaxRounds: Int = 0,
+        /**
+         * 思考等级 for the in-window Agent.
+         *
+         * Parsed here rather than in the loop so an unrecognised value from a
+         * newer settings build degrades to the default instead of throwing on a
+         * hot path. See `ThinkingLevel.fromWire`.
+         */
+        val agentThinking: ThinkingLevel = ThinkingLevel.DEFAULT,
+        /** Whether the request carries the thinking fields at all. */
+        val agentThinkingWire: ThinkingWire = ThinkingWire.Auto,
         val panels: List<String> = listOf("status", "log"),
         val revision: Long = 0,
         val raw: ModuleConfigSnapshot = ModuleConfigSnapshot(),
@@ -174,6 +186,8 @@ internal class ModuleConfig(private val module: XposedModule) {
                 agentModel = model.agentModel,
                 agentApiKey = model.agentApiKey,
                 agentMaxRounds = model.agentMaxRounds,
+                agentThinking = ThinkingLevel.fromWire(model.agentThinking),
+                agentThinkingWire = ThinkingWire.fromWire(model.agentThinkingWire),
                 panels = model.panels,
                 revision = model.revision,
                 raw = model,

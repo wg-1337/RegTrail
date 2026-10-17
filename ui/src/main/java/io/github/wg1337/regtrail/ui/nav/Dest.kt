@@ -5,6 +5,7 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.EditNote
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Palette
@@ -88,6 +89,17 @@ enum class Dest(
 
     /** Base URL, API key, model and tool-round budget for the Agent. */
     AgentSettings("agent-settings", "模型配置", Icons.Filled.SmartToy, ownedBy = Settings),
+
+    /**
+     * The script library and its editor.
+     *
+     * A sub-page of [Settings] rather than a tab: a script is *written once and
+     * replayed forever*, so it is configuration-shaped, not a live surface like
+     * the terminal or the debugger — but it is also the durable output of a
+     * debug session, which is why it sits in its own group instead of being
+     * buried inside 调试.
+     */
+    Scripts("scripts", "脚本", Icons.Filled.EditNote, ownedBy = Settings),
 
     /** Root/LSPosed/device self-check. */
     SelfCheck("selfcheck", "环境自检", Icons.Filled.Build, ownedBy = Settings),

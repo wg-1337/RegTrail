@@ -637,6 +637,113 @@ button.mini.danger:active {
   color: #ffb3ad;
 }
 
+/*
+ * One collapsed row per tool call.
+ *
+ * A turn can make eight calls, each with a JSON argument object and a JSON
+ * result. Rendering them as `.msg.tool` blobs turned the conversation into a wall
+ * of braces that pushed the answer off a 300 dp panel. A <details> element gives
+ * the collapse for free (no JS, no animation cost) and starts collapsed, so the
+ * default view is one identifying line per call.
+ *
+ * The base font is deliberately small: this is the highest-density part of the
+ * panel, and the row is a signpost, not the content.
+ */
+.agent-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 5px;
+}
+
+details.step {
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 3px 6px;
+}
+
+details.step[data-ok="0"] {
+  background: rgba(255, 123, 114, 0.12);
+}
+
+details.step > summary {
+  color: var(--fg-dim);
+  font-size: calc(10px * var(--regtrail-font-scale));
+  line-height: 1.35;
+  cursor: pointer;
+  /* Long class names and JSON must not widen the panel. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  list-style: none;
+}
+
+/* Hide the default triangle: the +/− marker below is the affordance. */
+details.step > summary::-webkit-details-marker { display: none; }
+
+details.step > summary::before {
+  content: "▸ ";
+  color: var(--accent, #ffb300);
+}
+
+details.step[open] > summary::before { content: "▾ "; }
+
+details.step[data-ok="0"] > summary::before {
+  color: #ff7b72;
+}
+
+.step-body {
+  margin: 4px 0 2px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--fg-dim);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10px * var(--regtrail-font-scale));
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 180px;
+  overflow: auto;
+}
+
+/*
+ * 思考过程: collapsed by default and visually separated from the reply, because
+ * it is context for "why did it say that", not the answer itself.
+ */
+details.reasoning {
+  margin-top: 5px;
+  padding: 3px 6px;
+  border-radius: 7px;
+  border: 1px dashed var(--line);
+}
+
+details.reasoning > summary {
+  color: var(--fg-dim);
+  font-size: calc(10px * var(--regtrail-font-scale));
+  cursor: pointer;
+  list-style: none;
+}
+
+details.reasoning > summary::-webkit-details-marker { display: none; }
+
+details.reasoning > summary::before {
+  content: "▸ ";
+  color: var(--fg-dim);
+}
+
+details.reasoning[open] > summary::before { content: "▾ "; }
+
+.reasoning-body {
+  margin: 4px 0 2px;
+  color: var(--fg-dim);
+  font-size: calc(10px * var(--regtrail-font-scale));
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow: auto;
+}
+
 details#agent-console {
   margin-top: 10px;
   border-top: 1px solid var(--line);

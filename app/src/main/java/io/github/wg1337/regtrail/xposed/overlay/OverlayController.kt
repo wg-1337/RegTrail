@@ -118,20 +118,34 @@ internal class OverlayController(
     private var dragOriginOffsetY = 0
 
     /**
-     * Size of the **expanded** panel, in dp.
+     * Size *and* position of the panel, in dp — the single source of truth.
      *
-     * Volatile because it is written on the main thread (a resize drag, an
-     * Activity re-attach) and read from the WebView's JS bridge thread by the
-     * `status` message, which the page polls. A torn pair would show the user a
-     * wrong size, and `Pair` is immutable so a volatile field is enough.
+     * Volatile because it is written on the main thread (a resize drag, an Activity
+     * re-attach) and read from the WebView's JS bridge thread by the `status`
+     * message and by the drag handlers, which the page polls. A torn read would
+     * show the user a wrong size, and [PanelGeometry] is immutable so a volatile
+     * field is enough.
      *
-     * The collapsed size is not stored here: it is a fixed pill whose dimensions
-     * belong to [FloatingOverlayView], and keeping it out of this field is what
-     * makes "expand" able to restore the user's chosen size at all.
+     * ## Why the position lives here and not in the fallback
+     * The `DecorView` mechanism rebuilds its view on every Activity change, so it
+     * must not own anything durable. Keeping the intent here — and persisting it
+     * through [OverlaySizeStore] — is what makes "re-attach restores what the user
+     * chose" a structural property instead of something each attach path has to
+     * remember to do. The fallback is a *renderer* of this value: it derives a
+     * clamped [PanelPlacement] for whatever Activity is in front and reports back
+     * only when the user actually drags.
      */
     @Volatile
-    private var panelSizeDp: Pair<Int, Int> =
-        OverlaySizeLimits.DEFAULT_WIDTH_DP to OverlaySizeLimits.DEFAULT_HEIGHT_DP
+    private var geometry: PanelGeometry = PanelGeometry()
+
+    /**
+     * The **expanded** panel size in dp, derived from [geometry].
+     *
+     * The collapsed size is deliberately not here: it is a fixed pill whose
+     * dimensions belong to [FloatingOverlayView], and keeping it out is what makes
+     * "expand" able to restore the user's chosen size at all.
+     */
+    private val panelSizeDp: Pair<Int, Int> get() = geometry.sizeDp
 
     /** Remembers a dragged size across target-process restarts. */
     private var sizeStore: OverlaySizeStore? = null
@@ -312,12 +326,12 @@ internal class OverlayController(
         }.getOrNull()
         wm?.let { windowManager = it }
 
-        // Resolve the panel size before the mechanism is chosen, so the two paths
-        // open at the same size. This is also where a size the user dragged in an
-        // earlier run of this app comes back. Deliberately after the
-        // `WindowManager` is stored, so the screen measurement it uses is the real
-        // window metric rather than the raw display metrics.
-        resolvePanelSize(context, snapshot)
+        // Resolve the panel geometry before the mechanism is chosen, so the two paths
+        // open at the same size and position. This is also where a size and position
+        // the user dragged in an earlier run of this app come back. Deliberately
+        // after the `WindowManager` is stored, so the screen measurement it uses is
+        // the real window metric rather than the raw display metrics.
+        resolveGeometry(context, snapshot)
 
         // Mechanism selection. DecorView is the default because it needs no
         // permission and, crucially, no system_server hook — so it cannot put the
@@ -348,6 +362,11 @@ internal class OverlayController(
             onCollapsedChanged = { collapsed -> applyCollapsed(collapsed) },
         )
         view.onDrag = { dx, dy -> moveBy(dx, dy) }
+        // A pill drag is a user decision about the window position: persist it once,
+        // on release, exactly like the header drag does through `webDragMove`.
+        view.onDragEnd = {
+            main.post { sizeStore?.rememberPosition(offsetX, offsetY) }
+        }
         // See [setImeFocus]: while a text field in the page is being edited this
         // window is focusable, and BACK has to drop that focus again.
         view.onBack = { main.post { setImeFocus(false) } }
@@ -412,12 +431,14 @@ internal class OverlayController(
         snapshot: ModuleConfig.Snapshot,
     ) {
         val app = context.applicationContext as? Application ?: return
-        // The size is handed over explicitly: this path has no `params` of its own,
-        // and the fallback must still open at whatever the user last dragged.
+        // The fallback renders [geometry] and reports back when the *user* changes
+        // it; it never keeps a copy of its own, so a re-attach cannot restore a
+        // stale value and a clamp can never leak into the store.
         val fallback = DecorOverlayFallback(
-            module = module,
             assets = ModuleAssets(module, context),
-            panelSizeDp = panelSizeDp,
+            geometry = { geometry },
+            onGeometryChanged = { next, persist -> onPanelGeometry(next, persist) },
+            initialCollapsed = sizeStore?.collapsed() ?: false,
         )
         decorFallback = fallback
 
@@ -425,10 +446,6 @@ internal class OverlayController(
             app = app,
             handler = { action, payload -> onWebMessage(action, payload) },
             onCollapsed = { collapsed -> applyCollapsed(collapsed) },
-            // A position the user dragged the panel to survives the target process
-            // being killed. The fallback clamps it once the container is laid out,
-            // so a saved value from a bigger screen cannot hide the panel.
-            savedMargins = sizeStore?.margins(),
         )
         fallback.applyConfig(snapshot.toJsonString())
         RegTrailLog.recent(80).forEach { fallback.appendLog(it) }
@@ -436,8 +453,26 @@ internal class OverlayController(
         mechanism = Mechanism.ActivityDecor
         RegTrailLog.i(
             "${param.packageName}: overlay attached via DecorView fallback " +
-                "(${panelSizeDp.first}x${panelSizeDp.second} dp)",
+                "(${geometry.describe()})",
         )
+    }
+
+    /**
+     * Records a geometry the *user* decided in the DecorView mechanism.
+     *
+     * The controller is the only writer of [OverlaySizeStore], which is why the
+     * fallback reports here instead of persisting itself: one place decides what
+     * the panel geometry is, and the two mechanisms cannot disagree about it.
+     *
+     * @param persist false for the intermediate frames of a drag; a 120 Hz touch
+     *   stream must not become a preference write per frame.
+     */
+    private fun onPanelGeometry(next: PanelGeometry, persist: Boolean) {
+        geometry = next
+        if (!persist) return
+        val topPx = next.topPx ?: return
+        val endPx = next.endPx ?: return
+        sizeStore?.rememberPlacement(topPx, endPx)
     }
 
     private fun buildLayoutParams(
@@ -471,31 +506,49 @@ internal class OverlayController(
     }
 
     /**
-     * Resolves the size the panel opens at and remembers what the config asked for.
+     * Resolves the geometry the panel opens at and remembers what the config asked for.
      *
-     * Two sources: the published default (settings app) and a remembered drag
-     * (this target app's private storage). [OverlaySizeStore.resolve] implements
-     * the rule that makes them coexist; this method only clamps the winner.
+     * Three sources, all of them resolved exactly once per process:
+     *  - the published default size (settings app),
+     *  - a size the user dragged in this target app ([OverlaySizeStore.resolve] owns
+     *    the rule that makes the two coexist),
+     *  - the position the panel was last left at, in screen pixels.
+     *
+     * Deliberately the *only* place that reads the store on attach: every re-attach
+     * inside the process re-uses [geometry], so navigating between Activities
+     * cannot re-derive anything from a default.
      */
-    private fun resolvePanelSize(context: Context, snapshot: ModuleConfig.Snapshot) {
+    private fun resolveGeometry(context: Context, snapshot: ModuleConfig.Snapshot) {
         configSizeDp = snapshot.overlayWidthDp to snapshot.overlayHeightDp
 
         val store = sizeStore ?: OverlaySizeStore(context).also { sizeStore = it }
         val remembered = store.resolve(snapshot.overlayWidthDp, snapshot.overlayHeightDp)
 
-        val density = context.resources.displayMetrics.density
-        panelSizeDp = OverlaySizeMath.clamp(
+        // The display density, not the Activity's: on this device the host app runs
+        // MainActivity at density 2.2222 and every other Activity at 2.0, so the
+        // Activity's density would size the same dp differently depending on where
+        // the user is (see [PanelLayoutMath.density]).
+        val density = PanelLayoutMath.density(context)
+        val size = OverlaySizeMath.clamp(
             widthDp = remembered.first,
             heightDp = remembered.second,
             screenWidthPx = screenWidthPx(context),
             screenHeightPx = screenHeightPx(context),
             density = density,
         )
+        val placement = store.placementPx()
+        geometry = PanelGeometry(
+            widthDp = size.first,
+            heightDp = size.second,
+            topPx = placement?.first,
+            endPx = placement?.second,
+        )
 
         RegTrailLog.d(
-            "${param.packageName}: panel size ${panelSizeDp.first}x${panelSizeDp.second} dp " +
+            "${param.packageName}: panel geometry ${geometry.describe()} " +
                 "(config=${snapshot.overlayWidthDp}x${snapshot.overlayHeightDp}, " +
-                "density=$density)",
+                "displayDensity=$density, " +
+                "activityDensity=${context.resources.displayMetrics.density})",
         )
     }
 
@@ -509,7 +562,9 @@ internal class OverlayController(
     private fun applyPanelSize(widthDp: Int, heightDp: Int, persist: Boolean = true) {
         val context = appContext ?: return
         val clamped = clampPanelSize(widthDp, heightDp) ?: return
-        panelSizeDp = clamped
+        // Size only: the position is the user's, and a resize must not move the
+        // panel's anchored corner out from under them.
+        geometry = geometry.resized(clamped.first, clamped.second)
 
         val view = overlayView
         val wm = windowManager
@@ -524,7 +579,9 @@ internal class OverlayController(
             runCatching { wm.updateViewLayout(view, lp) }
         }
 
-        decorFallback?.resizeTo(clamped.first, clamped.second)
+        // The DecorView mechanism derives its own placement from the same intent, so
+        // it needs no size argument — it needs to re-read the intent.
+        decorFallback?.refresh()
 
         if (persist) {
             sizeStore?.remember(
@@ -578,6 +635,10 @@ internal class OverlayController(
             resizeForCollapsed(collapsed)
         }
         decorFallback?.setCollapsed(collapsed)
+        // Persisted here, at the one place both mechanisms funnel through, so a
+        // collapse survives an Activity change *and* a restart of the target app
+        // instead of popping the panel open on the next launch.
+        sizeStore?.rememberCollapsed(collapsed)
         RegTrailLog.d("${param.packageName}: overlay collapsed=$collapsed")
     }
 
@@ -783,6 +844,17 @@ internal class OverlayController(
         // config asked for.
         put("widthDp", JsonPrimitive(panelSizeDp.first))
         put("heightDp", JsonPrimitive(panelSizeDp.second))
+        put("panelTopPx", JsonPrimitive(geometry.topPx ?: -1))
+        put("panelEndPx", JsonPrimitive(geometry.endPx ?: -1))
+        // And the same panel in screen pixels, which is the unit a screenshot can be
+        // compared against: this is what "the window must not change when the app
+        // navigates" is measured in.
+        decorFallback?.placementPx()?.let { live ->
+            put("panelX", JsonPrimitive(live.leftPx))
+            put("panelY", JsonPrimitive(live.topPx))
+            put("panelWidthPx", JsonPrimitive(live.widthPx))
+            put("panelHeightPx", JsonPrimitive(live.heightPx))
+        }
         put(
             "collapsed",
             JsonPrimitive(overlayView?.isCollapsed ?: decorFallback?.isCollapsed ?: false),
@@ -818,7 +890,11 @@ internal class OverlayController(
         val context = appContext ?: return buildJsonObject {
             put("density", JsonPrimitive(1))
         }
-        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+        // `density` here is the *display* density — the page's own unit, because the
+        // WebView renders one CSS pixel per dp at the display density. Publishing the
+        // Activity's density would hand the grip a scale factor that changes on every
+        // navigation to an Activity with an overridden density.
+        val density = PanelLayoutMath.density(context)
         val widthPx = screenWidthPx(context)
         val heightPx = screenHeightPx(context)
         return buildJsonObject {
@@ -827,6 +903,7 @@ internal class OverlayController(
             put("screenWidthDp", JsonPrimitive((widthPx / density).toInt()))
             put("screenHeightDp", JsonPrimitive((heightPx / density).toInt()))
             put("density", JsonPrimitive(density))
+            put("activityDensity", JsonPrimitive(context.resources.displayMetrics.density))
             put("minWidthDp", JsonPrimitive(OverlaySizeLimits.MIN_WIDTH_DP))
             put("minHeightDp", JsonPrimitive(OverlaySizeLimits.MIN_HEIGHT_DP))
             put("maxWidthDp", JsonPrimitive(OverlaySizeLimits.maxWidthDp(widthPx, density)))
@@ -1069,7 +1146,11 @@ internal class OverlayController(
         val view = overlayView ?: return webError("窗口尚未挂载")
         if (view.parent == null) return webError("窗口尚未显示")
 
-        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+        // The page measures in CSS pixels, one of which is one dp rendered at the
+        // *display* density (that is what the WebView's devicePixelRatio is). Using
+        // the Activity's density here made every drag overshoot by the ratio of the
+        // two on Activities with a 屏幕适配 override.
+        val density = PanelLayoutMath.density(context)
         val keep = dp(context, KEEP_ON_SCREEN_DP)
 
         dragOriginOffsetX = offsetX
@@ -1113,10 +1194,9 @@ internal class OverlayController(
         val decor = decorFallback
         if (decor != null && decor.isAttached) {
             val applied = decor.dragToDp(dxDp, dyDp)
-            if (isFinal && applied != 0 to 0) {
-                val margins = decor.marginsPx()
-                sizeStore?.rememberMargins(margins.first, margins.second)
-            }
+            // One preference write per gesture, never per frame: `final` is what the
+            // page sends on pointer-up (the same contract the resize grip uses).
+            if (isFinal) decor.persistPlacement()
             return webOk(
                 buildJsonObject {
                     put("dx", JsonPrimitive(applied.first))
@@ -1132,7 +1212,9 @@ internal class OverlayController(
         val view = overlayView ?: return webError("窗口尚未挂载")
         if (view.isCollapsed) return webError("折叠状态下不可拖动")
 
-        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+        // See `webDragBegin`: the page's dp is the display density, never the
+        // Activity's.
+        val density = PanelLayoutMath.density(context)
         val keep = dp(context, KEEP_ON_SCREEN_DP)
         val minX = keep - lp.width
         val maxX = maxOf(minX, screenWidth(wm) - keep)
@@ -1474,6 +1556,11 @@ internal class OverlayController(
                 put("hasKey", JsonPrimitive(snapshot.agentApiKey.isNotBlank()))
                 put("baseUrl", JsonPrimitive(snapshot.agentBaseUrl))
                 put("model", JsonPrimitive(snapshot.agentModel))
+                // 思考等级, as a label the page can print. Not a secret, and the
+                // panel is the only place the user can see which level actually
+                // reached this process.
+                put("thinking", JsonPrimitive(snapshot.agentThinking.label))
+                put("thinkingWire", JsonPrimitive(snapshot.agentThinkingWire.wire))
                 put("internet", JsonPrimitive(hasInternetPermission()))
                 put("messages", JsonPrimitive(InProcessAgent.pending()))
                 put("memSession", JsonPrimitive(MemorySessions.current() ?: 0))
@@ -1554,6 +1641,11 @@ internal class OverlayController(
             } else {
                 DEFAULT_AGENT_ROUNDS
             },
+            // 思考等级 travels with the published config because this loop
+            // builds its own HTTP request inside the target process and cannot
+            // read the settings app's preferences from here.
+            thinking = snapshot.agentThinking,
+            thinkingWire = snapshot.agentThinkingWire,
         )
 
         val job = InProcessJobs.submit("agentChat", InProcessJobs.Lane.AGENT) { handle ->
@@ -1571,9 +1663,24 @@ internal class OverlayController(
             )
             buildJsonObject {
                 put("reply", JsonPrimitive(outcome.reply))
+                // Structured steps: each carries what the model asked for and a
+                // one-line result, so the page can render one collapsed row per
+                // call instead of a text blob of arrows and JSON.
                 put("steps", buildJsonArray {
-                    outcome.steps.forEach { add(JsonPrimitive(it)) }
+                    outcome.steps.forEach { step ->
+                        add(
+                            buildJsonObject {
+                                put("name", JsonPrimitive(step.name))
+                                put("args", JsonPrimitive(step.arguments))
+                                put("result", JsonPrimitive(step.result))
+                                put("ok", JsonPrimitive(step.ok))
+                            },
+                        )
+                    }
                 })
+                if (outcome.reasoning.isNotBlank()) {
+                    put("reasoning", JsonPrimitive(outcome.reasoning))
+                }
                 put("allowDestructive", JsonPrimitive(allowDestructive))
                 put("messages", JsonPrimitive(InProcessAgent.pending()))
             }
@@ -1957,12 +2064,20 @@ internal class OverlayController(
             heightDp = heightDp,
             screenWidthPx = screenWidthPx(context),
             screenHeightPx = screenHeightPx(context),
-            density = context.resources.displayMetrics.density,
+            density = PanelLayoutMath.density(context),
         )
     }
 
+    /**
+     * dp → px for everything that ends up as a pixel size or pixel offset on screen.
+     *
+     * The **display** density, deliberately: `context.resources.displayMetrics` is a
+     * per-Activity value that the host app is free to override, and on the test
+     * device `MainActivity` reports 2.2222 while every other Activity reports 2.0 —
+     * which is what made the panel change size on navigation.
+     */
     private fun dp(context: Context, value: Float): Int =
-        (value * context.resources.displayMetrics.density + 0.5f).toInt()
+        (value * PanelLayoutMath.density(context) + 0.5f).toInt()
 
     /** Live state for the settings app. */
     fun status(): Pair<Boolean, String> = (overlayView != null) to mechanism.name
@@ -1992,7 +2107,7 @@ internal class OverlayController(
         if (published == configSizeDp) return
 
         val context = appContext ?: return
-        resolvePanelSize(context, snapshot)
+        resolveGeometry(context, snapshot)
         // `persist = false`: this size came *from* the config, so writing it back
         // as a local override would make the next published change look like a
         // no-op.

@@ -6,25 +6,35 @@ import io.github.wg1337.regtrail.BuildConfig
 import io.github.wg1337.regtrail.agent.AgentConfig
 import io.github.wg1337.regtrail.agent.AgentMessage
 import io.github.wg1337.regtrail.agent.AgentSession
+import io.github.wg1337.regtrail.agent.FileTools
 import io.github.wg1337.regtrail.bridge.ModuleBridgeClient
 import io.github.wg1337.regtrail.config.ConfigPublisher
+import io.github.wg1337.regtrail.data.ScriptStore
 import io.github.wg1337.regtrail.data.ThemeConfigStore
 import io.github.wg1337.regtrail.detect.EnvironmentDetector
 import io.github.wg1337.regtrail.patch.PatchRecord
 import io.github.wg1337.regtrail.patch.PatchRepository
 import io.github.wg1337.regtrail.patch.PatchStage
 import io.github.wg1337.regtrail.patch.PatchTarget
+import io.github.wg1337.regtrail.root.RootShell
 import io.github.wg1337.regtrail.scope.AppCatalog
 import io.github.wg1337.regtrail.scope.ScopeManager
+import io.github.wg1337.regtrail.shared.bridge.SharedPaths
 import io.github.wg1337.regtrail.shared.model.ModuleConfigSnapshot
 import io.github.wg1337.regtrail.shared.model.OverlayMechanism
+import io.github.wg1337.regtrail.shared.model.ScriptAction
+import io.github.wg1337.regtrail.shared.model.ScriptSpec
+import io.github.wg1337.regtrail.shared.model.ScriptTrigger
 import io.github.wg1337.regtrail.shared.model.ScopeUiState
 import io.github.wg1337.regtrail.shared.model.SelfCheckReport
+import io.github.wg1337.regtrail.shared.model.ThinkingLevel
+import io.github.wg1337.regtrail.shared.model.ThinkingWire
 import io.github.wg1337.regtrail.terminal.TerminalSession
 import io.github.wg1337.regtrail.ui.PlatformBridge
 import io.github.wg1337.regtrail.ui.RootStateUi
 import io.github.wg1337.regtrail.ui.agent.AgentConfigUi
 import io.github.wg1337.regtrail.ui.agent.AgentMessageUi
+import io.github.wg1337.regtrail.ui.agent.AgentToolStepUi
 import io.github.wg1337.regtrail.ui.agent.AgentUiState
 import io.github.wg1337.regtrail.ui.debug.ClassItemUi
 import io.github.wg1337.regtrail.ui.debug.DebugMessageUi
@@ -34,6 +44,11 @@ import io.github.wg1337.regtrail.ui.debug.MethodItemUi
 import io.github.wg1337.regtrail.ui.patch.PatchRecordUi
 import io.github.wg1337.regtrail.ui.patch.PatchTargetUi
 import io.github.wg1337.regtrail.ui.patch.PatchUiState
+import io.github.wg1337.regtrail.ui.script.ScriptActionUi
+import io.github.wg1337.regtrail.ui.script.ScriptDraftUi
+import io.github.wg1337.regtrail.ui.script.ScriptEntryUi
+import io.github.wg1337.regtrail.ui.script.ScriptUiState
+import io.github.wg1337.regtrail.ui.script.ScriptVersionUi
 import io.github.wg1337.regtrail.ui.terminal.TerminalEntry
 import io.github.wg1337.regtrail.ui.terminal.TerminalMode
 import io.github.wg1337.regtrail.ui.terminal.TerminalUiState
@@ -75,6 +90,82 @@ class RegTrailPlatform(
     private val bridge = ModuleBridgeClient(context)
     private val terminal = TerminalSession()
 
+    /**
+     * The script library: `filesDir/scripts/<id>/vNNNN.json` + a `current`
+     * pointer, with exports next door in `filesDir/script-exports`.
+     *
+     * Constructed eagerly (it only builds [java.io.File] handles; nothing is read
+     * until the first call) so every entry point — publisher, Agent tools, UI —
+     * shares one instance and therefore one lock.
+     */
+    private val scriptStore = ScriptStore(
+        root = java.io.File(context.filesDir, ScriptStore.LIBRARY_DIR_NAME),
+        exportDir = java.io.File(context.filesDir, ScriptStore.EXPORT_DIR_NAME),
+    )
+
+    /**
+     * Root-shell file access, used by [fileTools] only when the app's own uid
+     * cannot do the job.
+     *
+     * The workspace `/data/local/tmp/regtrail` is created by the root shell as
+     * `root:root 0755`: readable by anyone, writable only by root. Without this
+     * fallback every `write_file` into the workspace would fail with EACCES,
+     * which would make the tool useless for the one directory the Agent is most
+     * likely to want.
+     *
+     * The text travels base64-encoded so no quoting, newline or unicode hazard
+     * can reach the shell, and the write is `tmp` + `mv -f` so a failure cannot
+     * truncate an existing file. The size cap exists because Linux limits a
+     * single `execve` argument to ~128 KB (`MAX_ARG_STRLEN`), and base64 is 4/3
+     * of the payload.
+     */
+    private val rootFileChannel: FileTools.RootChannel = object : FileTools.RootChannel {
+
+        override suspend fun read(path: String): String? =
+            RootShell.run("cat '$path'", timeoutSeconds = 20).getOrNull()
+
+        override suspend fun write(path: String, text: String): Boolean {
+            if (text.length > ROOT_WRITE_CHARS) return false
+
+            val b64 = android.util.Base64.encodeToString(
+                text.toByteArray(Charsets.UTF_8),
+                android.util.Base64.NO_WRAP,
+            )
+            val dir = path.substringBeforeLast('/', "")
+            val command = buildString {
+                if (dir.isNotEmpty()) {
+                    append("mkdir -p '").append(dir).append("' && ")
+                }
+                append("printf '%s' '").append(b64).append("' | base64 -d > '")
+                append(path).append(".tmp'")
+                append(" && mv -f '").append(path).append(".tmp' '").append(path).append("'")
+                append(" && chmod 644 '").append(path).append("'")
+            }
+            return RootShell.run(command, timeoutSeconds = 30).isSuccess
+        }
+    }
+
+    /**
+     * File access for the Agent's `read_file` / `write_file`.
+     *
+     * Roots are the app's own directories plus the workspace. Writes that the
+     * app's uid cannot perform (the workspace is created `root:root 0755`) fall
+     * back to the root shell — see [rootFileChannel].
+     */
+    private val fileTools: FileTools = FileTools(
+        roots = buildList {
+            add(context.filesDir)
+            add(context.cacheDir)
+            context.getExternalFilesDir(null)?.let { add(it) }
+            add(java.io.File(SharedPaths.BASE_DIR))
+            themeStore.loadSettings().terminalWorkspacePath
+                .takeIf { it.startsWith("/") && it.length > 1 && !it.any { ch -> ch.isWhitespace() } }
+                ?.let { add(java.io.File(it)) }
+        }.distinct(),
+        defaultRoot = java.io.File(SharedPaths.BASE_DIR),
+        rootChannel = rootFileChannel,
+    )
+
     private val _scopeState = MutableStateFlow(ScopeUiState(busy = true))
     val scopeStateFlow: StateFlow<ScopeUiState> = _scopeState.asStateFlow()
 
@@ -86,6 +177,9 @@ class RegTrailPlatform(
 
     private val _agentState = MutableStateFlow(AgentUiState())
     val agentStateFlow: StateFlow<AgentUiState> = _agentState.asStateFlow()
+
+    private val _scriptState = MutableStateFlow(ScriptUiState())
+    val scriptStateFlow: StateFlow<ScriptUiState> = _scriptState.asStateFlow()
 
     /**
      * Monotonic counter bumped whenever any platform state changes.
@@ -558,12 +652,21 @@ class RegTrailPlatform(
         _agentState.value = _agentState.value.copy(messages = emptyList(), lastError = null)
     }
 
-    override fun saveAgentConfig(baseUrl: String, apiKey: String, model: String, rounds: Int) {
+    override fun saveAgentConfig(
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        rounds: Int,
+        thinking: String,
+        thinkingWire: String,
+    ) {
         val existing = themeStore.loadAgentConfig()
         val updated = existing.copy(
             baseUrl = baseUrl.ifBlank { AgentConfig.DEFAULT_BASE_URL },
             model = model.ifBlank { AgentConfig.DEFAULT_MODEL },
             maxToolRounds = rounds.coerceIn(1, 30),
+            thinking = ThinkingLevel.fromWire(thinking),
+            thinkingWire = ThinkingWire.fromWire(thinkingWire),
         )
         // null keeps the previously stored key, so the field can be left blank
         // on subsequent edits without wiping the credential.
@@ -572,12 +675,22 @@ class RegTrailPlatform(
         // Force the next turn to pick up the new configuration.
         agentSession = null
         pushAgentConfig()
+        // The in-window Agent reads the level from the published config, so a
+        // change here only reaches it after a republish.
+        scope.launch { publishConfigInternal(showMessage = false) }
     }
 
     private fun createAgentSession(): AgentSession {
         val session = AgentSession(
             configProvider = { themeStore.loadAgentConfig() },
             bridge = bridge,
+            scripts = scriptStore,
+            files = fileTools,
+            // A script the Agent just created is only in the library; the target
+            // process runs whatever `config.json` says, so every library mutation
+            // is followed by a publish. Failures are already reported by the
+            // publish path (root missing, etc.).
+            onScriptsChanged = { publishConfigInternal(showMessage = false) },
             onMessage = { message ->
                 val current = _agentState.value.messages
                 val next = (current + AgentMessageUi(
@@ -589,8 +702,20 @@ class RegTrailPlatform(
                     },
                     text = message.text,
                     toolCalls = message.toolCalls,
+                    toolSteps = message.toolSteps.map { step ->
+                        AgentToolStepUi(
+                            name = step.name,
+                            arguments = step.arguments,
+                            result = step.result,
+                            ok = step.ok,
+                        )
+                    },
+                    reasoning = message.reasoning,
                 )).takeLast(400)
                 _agentState.value = _agentState.value.copy(messages = next)
+                // Without this the screen only refreshed when the whole turn
+                // finished, so a slow tool looked like a frozen conversation.
+                bumpRevision()
             },
         )
         agentSession = session
@@ -611,6 +736,305 @@ class RegTrailPlatform(
         _agentState.value = _agentState.value.copy(
             config = themeStore.loadAgentConfig().toUi(),
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // Script library
+    // -----------------------------------------------------------------------
+
+    override fun scriptState(): ScriptUiState = _scriptState.value
+
+    /**
+     * Re-reads the whole library from disk.
+     *
+     * Always a full rescan rather than an incremental patch: the library is a
+     * handful of small files, and "the list disagrees with the disk" is a class
+     * of bug that only exists when a cache is trusted.
+     */
+    override fun refreshScripts() {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { runCatching { scriptStore.list() } }
+            result.fold(
+                onSuccess = { entries ->
+                    _scriptState.value = _scriptState.value.copy(
+                        entries = entries.map { it.toUi() },
+                        busy = false,
+                    )
+                },
+                onFailure = { t ->
+                    _scriptState.value = _scriptState.value.copy(
+                        busy = false,
+                        message = "读取脚本库失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    override fun editScript(id: String?, startNew: Boolean) {
+        scope.launch {
+            if (startNew || id.isNullOrBlank()) {
+                _scriptState.value = _scriptState.value.copy(
+                    draft = ScriptDraftUi(),
+                    versions = emptyList(),
+                    message = null,
+                    messageIsError = false,
+                )
+                bumpRevision()
+                return@launch
+            }
+
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val spec = scriptStore.load(id)
+                        ?: throw IllegalStateException("脚本不存在：$id")
+                    spec to scriptStore.versions(id)
+                }
+            }
+            result.fold(
+                onSuccess = { (spec, versions) ->
+                    _scriptState.value = _scriptState.value.copy(
+                        draft = spec.toDraft(),
+                        versions = versions.map { ScriptVersionUi(it.version, it.savedAt, it.actionCount) },
+                        message = null,
+                        messageIsError = false,
+                    )
+                },
+                onFailure = { t ->
+                    _scriptState.value = _scriptState.value.copy(
+                        message = t.message ?: "读取脚本失败",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    override fun closeScriptEditor() {
+        _scriptState.value = _scriptState.value.copy(
+            draft = null,
+            versions = emptyList(),
+            message = null,
+            messageIsError = false,
+        )
+        bumpRevision()
+    }
+
+    /**
+     * Creates or saves the current draft.
+     *
+     * The draft is a *form*: every field is a string, and a blank one means "not
+     * set" rather than "set to empty". Conversion to [ScriptAction] happens here
+     * so the UI never has to know the enum names beyond the labels it shows.
+     */
+    override fun saveScript(draft: ScriptDraftUi) {
+        scope.launch {
+            val spec = runCatching { draft.toSpec() }
+                .getOrElse { t ->
+                    _scriptState.value = _scriptState.value.copy(
+                        message = t.message ?: "脚本无法保存",
+                        messageIsError = true,
+                    )
+                    bumpRevision()
+                    return@launch
+                }
+
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    if (draft.isNew) scriptStore.create(spec) else scriptStore.update(draft.id, spec)
+                }
+            }
+
+            result.fold(
+                onSuccess = { saved ->
+                    val entries = withContext(Dispatchers.IO) {
+                        runCatching { scriptStore.list() }.getOrDefault(emptyList())
+                    }
+                    _scriptState.value = _scriptState.value.copy(
+                        entries = entries.map { it.toUi() },
+                        draft = saved.toDraft(),
+                        versions = withContext(Dispatchers.IO) {
+                            runCatching { scriptStore.versions(saved.id) }.getOrDefault(emptyList())
+                        }.map { ScriptVersionUi(it.version, it.savedAt, it.actionCount) },
+                        message = "${if (draft.isNew) "已创建" else "已保存"} v${saved.version}",
+                        messageIsError = false,
+                    )
+                    // The injected side runs the published list, so a save that
+                    // did not republish would silently not take effect.
+                    publishConfigInternal(showMessage = false)
+                },
+                onFailure = { t ->
+                    _scriptState.value = _scriptState.value.copy(
+                        message = "保存失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    override fun duplicateScript(id: String) {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { scriptStore.duplicate(id) }
+            }
+            result.fold(
+                onSuccess = { copy ->
+                    val entries = withContext(Dispatchers.IO) {
+                        runCatching { scriptStore.list() }.getOrDefault(emptyList())
+                    }
+                    _scriptState.value = _scriptState.value.copy(
+                        entries = entries.map { it.toUi() },
+                        message = "已复制为「${copy.name}」（v${copy.version}）",
+                        messageIsError = false,
+                    )
+                    publishConfigInternal(showMessage = false)
+                },
+                onFailure = { t ->
+                    _scriptState.value = _scriptState.value.copy(
+                        message = "复制失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    override fun deleteScript(id: String) {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { scriptStore.delete(id) }
+            }
+            result.fold(
+                onSuccess = { removed ->
+                    val entries = withContext(Dispatchers.IO) {
+                        runCatching { scriptStore.list() }.getOrDefault(emptyList())
+                    }
+                    val current = _scriptState.value
+                    _scriptState.value = current.copy(
+                        entries = entries.map { it.toUi() },
+                        // Deleting the script being edited would leave the editor
+                        // showing a ghost, so the draft goes too.
+                        draft = current.draft?.takeIf { it.id != id },
+                        versions = if (current.draft?.id == id) emptyList() else current.versions,
+                        message = if (removed) "已删除脚本" else "脚本已经不存在",
+                        messageIsError = !removed,
+                    )
+                    publishConfigInternal(showMessage = false)
+                },
+                onFailure = { t ->
+                    _scriptState.value = _scriptState.value.copy(
+                        message = "删除失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    override fun restoreScriptVersion(id: String, version: Int) {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { scriptStore.restore(id, version) }
+            }
+            result.fold(
+                onSuccess = { restored ->
+                    val entries = withContext(Dispatchers.IO) {
+                        runCatching { scriptStore.list() }.getOrDefault(emptyList())
+                    }
+                    _scriptState.value = _scriptState.value.copy(
+                        entries = entries.map { it.toUi() },
+                        draft = restored.toDraft(),
+                        versions = withContext(Dispatchers.IO) {
+                            runCatching { scriptStore.versions(id) }.getOrDefault(emptyList())
+                        }.map { ScriptVersionUi(it.version, it.savedAt, it.actionCount) },
+                        message = "已把 v$version 恢复成 v${restored.version}（历史都还在）",
+                        messageIsError = false,
+                    )
+                    publishConfigInternal(showMessage = false)
+                },
+                onFailure = { t ->
+                    _scriptState.value = _scriptState.value.copy(
+                        message = "恢复失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    override fun exportScripts() {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { scriptStore.exportBundle() }
+            }
+            result.fold(
+                onSuccess = { file ->
+                    _scriptState.value = _scriptState.value.copy(
+                        exportPath = file.absolutePath,
+                        message = "已导出 ${file.length()} 字节到 ${file.absolutePath}",
+                        messageIsError = false,
+                    )
+                },
+                onFailure = { t ->
+                    _scriptState.value = _scriptState.value.copy(
+                        message = "导出失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    override fun importScripts(json: String) {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { scriptStore.importBundle(json) }
+            }
+            result.fold(
+                onSuccess = { imported ->
+                    val entries = withContext(Dispatchers.IO) {
+                        runCatching { scriptStore.list() }.getOrDefault(emptyList())
+                    }
+                    _scriptState.value = _scriptState.value.copy(
+                        entries = entries.map { it.toUi() },
+                        message = buildString {
+                            append("已导入 ").append(imported.imported).append(" 个脚本")
+                            if (imported.renamed > 0) {
+                                append("（其中 ").append(imported.renamed)
+                                append(" 个与原 id 冲突，已改用新 id，原脚本未被覆盖）")
+                            }
+                            if (imported.skipped > 0) {
+                                append("；跳过 ").append(imported.skipped).append(" 个空脚本")
+                            }
+                        },
+                        messageIsError = false,
+                    )
+                    publishConfigInternal(showMessage = false)
+                },
+                onFailure = { t ->
+                    _scriptState.value = _scriptState.value.copy(
+                        message = "导入失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    /** Clears just the transient message line above the list. */
+    override fun clearScriptMessage() {
+        _scriptState.value = _scriptState.value.copy(message = null, messageIsError = false)
+        bumpRevision()
     }
 
     // -----------------------------------------------------------------------
@@ -834,6 +1258,13 @@ class RegTrailPlatform(
         // so the settings screens and the module can never disagree about it.
         val agent = themeStore.loadAgentConfig()
 
+        // The library is on disk, so this is real I/O. `publishConfigInternal` is
+        // called from the main-thread scope (and from Compose callbacks), so the
+        // read is moved off it rather than trusted to be fast.
+        val scripts = withContext(Dispatchers.IO) {
+            runCatching { scriptStore.publishable() }.getOrDefault(emptyList())
+        }
+
         val snapshot = ModuleConfigSnapshot(
             // The "随目标应用启动时显示悬浮窗" switch. Off means the module is
             // still loaded (the debugger keeps working) but creates no window in
@@ -871,6 +1302,16 @@ class RegTrailPlatform(
             agentModel = agent.model,
             agentApiKey = agent.apiKey,
             agentMaxRounds = agent.maxToolRounds,
+            // 思考等级 + 是否发送思考参数。 The in-window Agent builds its own
+            // request inside the target process, so both choices have to travel
+            // with the snapshot; empty strings mean "the module's default", which
+            // is what an older config.json gets.
+            agentThinking = agent.thinking.wire,
+            agentThinkingWire = agent.thinkingWire.wire,
+            // The current version of every script in the library. `ScriptSpec`
+            // itself is unchanged, so a module build from before the library
+            // existed simply ignores this list.
+            scripts = scripts,
             // `mem`, `debug` and `agent` are the tabs the panel gained; the page hides
             // any tab this list does not name, so a stale publish means "no 内存 tab".
             panels = listOf("status", "log", "tools", "mem", "debug", "agent"),
@@ -1005,7 +1446,93 @@ private fun AgentConfig.toUi(): AgentConfigUi = AgentConfigUi(
     model = model,
     hasApiKey = apiKey.isNotBlank(),
     maxToolRounds = maxToolRounds,
+    thinking = thinking.name,
+    thinkingWire = thinkingWire.name,
 )
+
+// ---------------------------------------------------------------------------
+// Script library translation
+// ---------------------------------------------------------------------------
+
+private fun ScriptStore.Entry.toUi(): ScriptEntryUi = ScriptEntryUi(
+    id = id,
+    name = name,
+    description = description,
+    enabled = enabled,
+    trigger = trigger.name,
+    actionCount = actionCount,
+    versionCount = versionCount,
+    currentVersion = currentVersion,
+    updatedAt = updatedAt,
+)
+
+private fun ScriptSpec.toDraft(): ScriptDraftUi = ScriptDraftUi(
+    id = id,
+    name = name,
+    description = description,
+    enabled = enabled,
+    trigger = trigger.name,
+    triggerTarget = triggerTarget.orEmpty(),
+    triggerMethod = triggerMethod.orEmpty(),
+    actions = actions.map { it.toUi() },
+)
+
+private fun ScriptAction.toUi(): ScriptActionUi = ScriptActionUi(
+    kind = kind.name,
+    className = className.orEmpty(),
+    memberName = memberName.orEmpty(),
+    signature = signature.orEmpty(),
+    value = value.orEmpty(),
+    valueType = valueType.name,
+    receiver = receiver.orEmpty(),
+)
+
+/**
+ * Turns the editor's string form back into a [ScriptSpec].
+ *
+ * @throws IllegalArgumentException with a message the editor shows verbatim —
+ *   "第 2 个动作缺少类名" is actionable, a `valueOf` crash is not.
+ */
+private fun ScriptDraftUi.toSpec(): ScriptSpec {
+    val cleanName = name.trim()
+    if (cleanName.isEmpty()) throw IllegalArgumentException("脚本名不能为空")
+
+    val triggerValue = ScriptTrigger.entries.firstOrNull { it.name == trigger }
+        ?: throw IllegalArgumentException("未知的触发时机：$trigger")
+
+    val mapped = actions.mapIndexed { index, action ->
+        val position = index + 1
+        val kind = ScriptAction.Kind.entries.firstOrNull { it.name == action.kind }
+            ?: throw IllegalArgumentException("第 $position 个动作的 kind 未知：${action.kind}")
+        val className = action.className.trim()
+        if (className.isEmpty()) {
+            throw IllegalArgumentException("第 $position 个动作缺少类名")
+        }
+        ScriptAction(
+            kind = kind,
+            className = className,
+            memberName = action.memberName.trim().ifEmpty { null },
+            signature = action.signature.trim().ifEmpty { null },
+            value = action.value.takeIf { it.isNotBlank() },
+            valueType = ScriptAction.ValueType.entries.firstOrNull { it.name == action.valueType }
+                ?: ScriptAction.ValueType.Auto,
+            receiver = action.receiver.trim().ifEmpty { null },
+        )
+    }
+
+    if (mapped.isEmpty()) throw IllegalArgumentException("至少要有一个动作")
+
+    return ScriptSpec(
+        id = id,
+        name = cleanName,
+        enabled = enabled,
+        trigger = triggerValue,
+        triggerTarget = triggerTarget.trim().ifEmpty { null },
+        triggerMethod = triggerMethod.trim().ifEmpty { null },
+        actions = mapped,
+        description = description.trim(),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // P6 — cross-module translation for the packaging screen
@@ -1035,3 +1562,12 @@ private fun PatchRecord.toUi(): PatchRecordUi = PatchRecordUi(
 
 /** Log tag for the settings-side diagnostics. */
 private const val TAG = "RegTrail"
+
+/**
+ * Largest text the root file channel will hand to `su` in one command.
+ *
+ * Linux caps a single `execve` argument at `MAX_ARG_STRLEN` (128 KB) and the
+ * payload is base64 (4/3 of its size) inside a `printf '%s' '…'` argument, so
+ * 64 K characters of text is the honest ceiling with headroom to spare.
+ */
+private const val ROOT_WRITE_CHARS = 64 * 1024
