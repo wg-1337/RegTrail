@@ -27,3 +27,4 @@ _research/*.jar
 
 # On-device debugging scratch (adb screenshots, pulled module logs)
 .devlogs/
+.kotlin/
