@@ -154,9 +154,17 @@ object AgentTools {
         {"type":"array","description":"按顺序执行的动作。kind 决定哪些字段有意义：Trace/SetReturn/SetArg 对 className#memberName(signature) 挂 Hook；GetField/SetField 直接读写字段；CallMethod 反射调用。","items":{"type":"object","properties":{"kind":{"type":"string","enum":["Trace","SetReturn","SetArg","GetField","SetField","CallMethod"],"description":"Trace=记录调用；SetReturn=改返回值；SetArg=改第 1 个参数；GetField=读字段并记录；SetField=写字段；CallMethod=调用方法"},"className":{"type":"string","description":"完整类名，如 com.example.Login"},"memberName":{"type":"string","description":"方法名或字段名；构造函数写 <init>"},"signature":{"type":"string","description":"参数类型列表，如 (java.lang.String,int)；留空=第一个同名方法"},"value":{"type":"string","description":"SetReturn / SetField / SetArg 的字面量"},"valueType":{"type":"string","enum":["Auto","Boolean","Int","Long","Float","Double","String","Null"],"description":"按此类型解析 value，默认 Auto"},"receiver":{"type":"string","description":"CallMethod 的接收者表达式，可空"}},"required":["kind"]}}
     """.trimIndent()
 
-    /** Trigger names, reused by `script_create` and `script_update`. */
+    /**
+     * Trigger names, reused by `script_create` and `script_update`.
+     *
+     * Ends with exactly one `}`: this string is substituted *inside* a larger
+     * object, so a stray brace here closes the enclosing `properties` early and
+     * the whole request body becomes invalid JSON. `ThinkingRequestBodyTest`
+     * parses every tool schema precisely because that mistake compiles fine and
+     * only shows up as a 400 from the provider.
+     */
     private val TRIGGER_SCHEMA: String =
-        """{"type":"string","enum":["AppAttach","AppOnCreate","ActivityOnCreate","ActivityOnResume","ClassLoaded","MethodEnter","Manual"],"description":"何时执行：Manual=窗口按钮/script_run 手动触发；AppAttach=attachBaseContext；AppOnCreate=Application.onCreate；Activity*=匹配 triggerTarget 的 Activity；ClassLoaded=匹配 triggerTarget 的类加载；MethodEnter=triggerMethod 首个被调用的方法"}}"""
+        """{"type":"string","enum":["AppAttach","AppOnCreate","ActivityOnCreate","ActivityOnResume","ClassLoaded","MethodEnter","Manual"],"description":"何时执行：Manual=窗口按钮/script_run 手动触发；AppAttach=attachBaseContext；AppOnCreate=Application.onCreate；Activity*=匹配 triggerTarget 的 Activity；ClassLoaded=匹配 triggerTarget 的类加载；MethodEnter=triggerMethod 首个被调用的方法"}"""
 
     /** Path rules, quoted in both file tools so the model does not try `/system`. */
     private val FILE_ROOTS_NOTE: String =
