@@ -144,8 +144,14 @@ fun HomeScreen(
                         }.trim()
                         !scopeState.bound -> "模块已安装，但尚未连接到 LSPosed 框架。"
                         scopeCount == 0 -> "去「目标」页选择要注入的应用。"
-                        !scopeState.hasSystemScope ->
-                            "建议授权 system 作用域，否则悬浮窗会因缺少权限被拒绝。"
+                        // Only nag when the *selected* mechanism actually needs it.
+                        // The default DecorView overlay needs no `system` scope, so
+                        // telling every user to grant one both misleads them and
+                        // pushes them at the one option that can stop the device
+                        // from booting. Verified on device: this banner used to say
+                        // "建议授权 system 作用域" while 注入方式 read "内嵌式（安全）".
+                        scopeState.requiresSystemScope && !scopeState.hasSystemScope ->
+                            "你选择了「免权限悬浮窗」，它需要先授权 system 作用域。"
                         else -> "悬浮窗会在目标应用启动时自动出现。"
                     },
                     style = MaterialTheme.typography.bodyMedium,
