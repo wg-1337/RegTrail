@@ -29,6 +29,21 @@ data class ThemeConfig(
     val overlayDefaultX: Float = 0.75f,
     /** Overlay default Y offset as a fraction of screen height, 0.0 .. 1.0. */
     val overlayDefaultY: Float = 0.25f,
+    /**
+     * Default size of the expanded floating window, in dp.
+     *
+     * This is the *published* default, not the live size: the window can be
+     * dragged to a different size at runtime, and that choice is remembered
+     * inside the target process itself (`OverlaySizeStore`) because the module
+     * cannot write the root-owned `config.json`. Changing either slider here
+     * publishes a new default, which then wins over the remembered drag — that is
+     * how the user resets a window they sized badly.
+     *
+     * Kept with defaults for the same reason as the fields on
+     * `ModuleConfigSnapshot`: existing stored JSON has no such keys.
+     */
+    val overlayWidthDp: Int = OverlaySizeLimits.DEFAULT_WIDTH_DP,
+    val overlayHeightDp: Int = OverlaySizeLimits.DEFAULT_HEIGHT_DP,
     /** When true, follow the system's Material You palette for the app scheme. */
     val useDynamicColor: Boolean = false,
     /** Community Material palette name used when [useDynamicColor] is false. */

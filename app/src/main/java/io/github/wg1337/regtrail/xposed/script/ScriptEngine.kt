@@ -76,18 +76,25 @@ internal object ScriptEngine {
 
         // Re-index. Old hook registrations stay alive but resolve to the new
         // script list, so editing a script does not need a reboot.
-        byTrigger.clear()
-        broken.clear()
+        //
+        // Guarded because the floating window's 「列出脚本」 button reads this map
+        // from the WebView's JS-bridge thread, which is *not* the thread that runs
+        // this re-index. A concurrent HashMap read against a write can corrupt or
+        // throw, and a throw here would take down injection.
+        synchronized(byTrigger) {
+            byTrigger.clear()
+            broken.clear()
 
-        val enabled = snapshot.raw.scripts.filter { it.enabled && it.id.isNotBlank() }
-        enabled.forEach { script ->
-            byTrigger.getOrPut(script.trigger) { mutableListOf() }.add(script)
+            val enabled = snapshot.raw.scripts.filter { it.enabled && it.id.isNotBlank() }
+            enabled.forEach { script ->
+                byTrigger.getOrPut(script.trigger) { mutableListOf() }.add(script)
+            }
+
+            RegTrailLog.i(
+                "ScriptEngine: ${enabled.size} script(s) loaded " +
+                    byTrigger.entries.joinToString { "${it.key}=${it.value.size}" },
+            )
         }
-
-        RegTrailLog.i(
-            "ScriptEngine: ${enabled.size} script(s) loaded " +
-                byTrigger.entries.joinToString { "${it.key}=${it.value.size}" },
-        )
 
         // Install the dispatchers this config needs.
         if (byTrigger.containsKey(ScriptTrigger.ClassLoaded)) installClassLoadedHook()
@@ -147,8 +154,10 @@ internal object ScriptEngine {
     /** Entry point for the floating window's "run script" button. */
     fun runManual(scriptId: String, context: Context?): String {
         val activeLoader = loader ?: return "尚未捕获目标 ClassLoader"
-        val script = byTrigger.values.flatten().firstOrNull { it.id == scriptId }
-            ?: return "未找到脚本 $scriptId"
+        // Copied under the same lock `boot()` writes with; see there.
+        val script = synchronized(byTrigger) {
+            byTrigger.values.flatten().firstOrNull { it.id == scriptId }
+        } ?: return "未找到脚本 $scriptId"
 
         return runCatching {
             execute(script, activeLoader, context, null)
@@ -159,7 +168,19 @@ internal object ScriptEngine {
         }
     }
 
-    val scriptIds: List<String> get() = byTrigger.values.flatten().filter { it.enabled }.map { it.id }
+    /**
+     * The scripts the floating window may offer a 「运行」 button for.
+     *
+     * Returns whole [ScriptSpec]s rather than bare ids because the tools tab
+     * shows a *name* next to each button: an id alone is usually a UUID-like
+     * string and tells the user nothing. `distinctBy` guards against a config
+     * that lists the same script under two triggers.
+     */
+    fun scriptEntries(): List<ScriptSpec> = synchronized(byTrigger) {
+        byTrigger.values.flatten().filter { it.enabled }.distinctBy { it.id }
+    }
+
+    val scriptIds: List<String> get() = scriptEntries().map { it.id }
 
     // -----------------------------------------------------------------------
     // Execution

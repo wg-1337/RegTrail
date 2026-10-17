@@ -8,6 +8,7 @@ import android.os.Build
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
@@ -16,9 +17,11 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import io.github.wg1337.regtrail.xposed.RegTrailLog
 import java.io.ByteArrayInputStream
+import kotlin.math.abs
 
 /**
  * The injected floating window: a WebView plus a collapsed "pill" state.
@@ -48,17 +51,21 @@ internal class FloatingOverlayView(
 ) : FrameLayout(context) {
 
     private val webView: WebView
-    private val collapsedPill: TextView
+    private val collapsedPill: LinearLayout
 
     /** Set by the controller so the drag handler can update window gravity. */
     var onDrag: ((dx: Int, dy: Int) -> Unit)? = null
-
-    var onResize: ((width: Int, height: Int) -> Unit)? = null
 
     private var collapsed = false
 
     private var downRawX = 0f
     private var downRawY = 0f
+
+    /** Total finger travel since ACTION_DOWN, to tell a tap from a drag. */
+    private var dragDistance = 0f
+
+    /** Distance beyond which a gesture is a drag and no longer a tap. */
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
 
     init {
         setBackgroundColor(Color.TRANSPARENT)
@@ -83,29 +90,83 @@ internal class FloatingOverlayView(
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT),
         )
 
-        collapsedPill = TextView(context).apply {
-            text = "RT"
-            setTextColor(Color.WHITE)
-            textSize = 12f
-            gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(ACCENT)
-                setStroke(dp(1.5f), 0x66FFFFFF)
-            }
-            visibility = GONE
-            setOnTouchListener(dragListener())
-            setOnClickListener {
-                setCollapsed(false)
-                onCollapsedChanged(false)
-            }
-        }
+        collapsedPill = buildPill(context)
         addView(
             collapsedPill,
-            LayoutParams(dp(34f), dp(34f)).apply { gravity = Gravity.CENTER },
+            LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+                gravity = Gravity.CENTER
+            },
         )
     }
 
+    /**
+     * The collapsed state: the RegTrail dot plus a short label in one pill.
+     *
+     * ## Why a pill and not just a dot
+     * A bare dot is indistinguishable from a notification badge or a foreign
+     * app's floating button, so the user cannot tell which thing to tap to get
+     * the panel back. The label is the recognition anchor; the dot keeps the
+     * window's accent colour visible so the pill still reads as "RegTrail" at a
+     * glance once the user knows what to look for.
+     *
+     * The pill is `wrap_content` inside a container the controller sizes to
+     * [COLLAPSED_WIDTH_DP] x [COLLAPSED_HEIGHT_DP], centred — so the *touchable*
+     * window is a predictable rectangle while the visible part stays compact.
+     */
+    private fun buildPill(context: Context): LinearLayout = LinearLayout(context).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(dp(9f), dp(6f), dp(11f), dp(6f))
+        background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(PILL_CORNER_DP).toFloat()
+            setColor(PILL_BG)
+            setStroke(dp(1f), PILL_STROKE)
+        }
+
+        addView(
+            View(context).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(ACCENT)
+                }
+            },
+            LinearLayout.LayoutParams(dp(7f), dp(7f)),
+        )
+
+        addView(
+            TextView(context).apply {
+                text = "RegTrail"
+                setTextColor(ACCENT)
+                textSize = 11f
+                maxLines = 1
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { marginStart = dp(6f) },
+        )
+
+        visibility = GONE
+        // Drag anywhere on the pill, tap to expand. `dragListener()` returns
+        // false for ACTION_UP on purpose so the click still fires — see there.
+        setOnTouchListener(dragListener())
+        setOnClickListener {
+            setCollapsed(false)
+            onCollapsedChanged(false)
+        }
+    }
+
+    /**
+     * Switches between the panel and the pill.
+     *
+     * ## What this must not do
+     * It must not call `loadUrl` / `reload`. The WebView carries the whole UI
+     * state — the selected tab, the scrolled log, the script list fetched from
+     * the bridge — and collapsing is a *window size* change, not a navigation.
+     * Hiding the view keeps that state; reloading would throw it away and make
+     * expand feel like a fresh start.
+     */
     fun setCollapsed(value: Boolean) {
         collapsed = value
         webView.visibility = if (value) GONE else VISIBLE
@@ -149,15 +210,33 @@ internal class FloatingOverlayView(
                 MotionEvent.ACTION_DOWN -> {
                     downRawX = event.rawX
                     downRawY = event.rawY
+                    dragDistance = 0f
                     return true
                 }
+
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - downRawX).toInt()
-                    val dy = (event.rawY - downRawY).toInt()
+                    val dx = event.rawX - downRawX
+                    val dy = event.rawY - downRawY
                     downRawX = event.rawX
                     downRawY = event.rawY
-                    onDrag?.invoke(dx, dy)
+                    dragDistance += abs(dx) + abs(dy)
+                    if (dx != 0f || dy != 0f) onDrag?.invoke(dx.toInt(), dy.toInt())
                     return true
+                }
+
+                MotionEvent.ACTION_UP -> {
+                    // Distinguish a tap (expand) from the end of a drag. Returning
+                    // true here *consumes* the event, which suppresses the click:
+                    // expanding the panel every time the user repositions the pill
+                    // is the most annoying possible interaction bug.
+                    val wasDrag = dragDistance > touchSlop
+                    dragDistance = 0f
+                    return wasDrag
+                }
+
+                MotionEvent.ACTION_CANCEL -> {
+                    dragDistance = 0f
+                    return false
                 }
             }
             return false
@@ -177,7 +256,24 @@ internal class FloatingOverlayView(
         /** Entry page, relative to [ASSET_DIR]. */
         const val PAGE = "index.html"
 
+        /**
+         * Window size while collapsed, in dp.
+         *
+         * The pill itself is `wrap_content`, so these describe the *window* the
+         * controller hands to `LayoutParams` — just large enough for the pill plus
+         * a comfortable tap slop margin, and small enough not to cover the host
+         * app's UI. Both mechanisms size to these values, so the pill looks the
+         * same whichever one is live.
+         */
+        const val COLLAPSED_WIDTH_DP = 112f
+        const val COLLAPSED_HEIGHT_DP = 38f
+
+        /** Height of the collapsed grip; kept here so the corner stays circular. */
+        private const val PILL_CORNER_DP = COLLAPSED_HEIGHT_DP / 2f
+
         private const val ACCENT = 0xFFFFB300.toInt()
+        private const val PILL_BG = 0xF218181C.toInt()
+        private const val PILL_STROKE = 0x66FFB300
     }
 
     /**

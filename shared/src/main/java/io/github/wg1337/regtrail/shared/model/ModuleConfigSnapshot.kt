@@ -72,6 +72,25 @@ data class ModuleConfigSnapshot(
     val overlayDefaultX: Float = 0.75f,
     val overlayDefaultY: Float = 0.25f,
 
+    /**
+     * Size of the expanded floating window, in dp.
+     *
+     * These two fields were added **after** the first signed builds shipped, so
+     * both *must* keep defaults: an older `config.json` (which has neither key)
+     * still decodes to the historical 300x380 dp panel instead of failing to
+     * parse. `@Serializable` fills in defaults for absent keys, which is exactly
+     * the backwards-compatibility property this relies on.
+     *
+     * The value published here is only the **starting** size. The user can drag
+     * the resize grip inside the window, and that choice is remembered per
+     * target process (see `OverlaySizeStore` on the module side). When the
+     * settings app publishes a value that differs from the one an earlier
+     * resize was based on, the published value wins — that is what makes the
+     * slider in the settings app actually do something.
+     */
+    val overlayWidthDp: Int = OverlaySizeLimits.DEFAULT_WIDTH_DP,
+    val overlayHeightDp: Int = OverlaySizeLimits.DEFAULT_HEIGHT_DP,
+
     /** Which panels the window shows, in order. */
     val panels: List<String> = listOf("status", "log"),
 
@@ -92,6 +111,70 @@ data class ModuleConfigSnapshot(
     companion object {
         const val VERSION = 1
     }
+}
+
+/**
+ * Size limits for the injected floating window, in dp.
+ *
+ * ## Why these live in `shared`
+ * Three different places need the *same* limits and would drift apart if each
+ * hard-coded its own numbers:
+ *
+ *  - the module, which clamps a `resize` message coming from the window's own
+ *    web UI (a drag can otherwise produce negative or off-screen sizes),
+ *  - the module again, which clamps what the settings app published before
+ *    handing it to `LayoutParams` (a hand-edited config file must not be able to
+ *    create a window the user cannot reach),
+ *  - the settings app's sliders, so the range the user can pick is the range the
+ *    module will accept.
+ *
+ * The floor is deliberately larger than "a few pixels": below roughly 220x200 dp
+ * the tab bar and the resize grip overlap and the window becomes unusable with
+ * no way to recover except clearing app data. The ceiling is expressed as a
+ * *fraction of the screen* rather than a fixed dp value because the honest upper
+ * bound depends on the device — a 320 dp-wide phone and a 1000 dp-wide tablet
+ * have nothing useful in common here.
+ */
+object OverlaySizeLimits {
+
+    /** Narrowest usable panel; the tab labels stop fitting below this. */
+    const val MIN_WIDTH_DP = 220
+
+    /** Shortest usable panel; header + tabs + one row of content. */
+    const val MIN_HEIGHT_DP = 200
+
+    /**
+     * Size the window opens at when nothing else is known.
+     *
+     * Chosen (and verified) against a landscape 2000x1200 @ density 320 device:
+     * 300x380 dp is a comfortable fraction of the 1000x600 dp available and does
+     * not cover the host app's primary content.
+     */
+    const val DEFAULT_WIDTH_DP = 300
+    const val DEFAULT_HEIGHT_DP = 380
+
+    /** Upper bound as a fraction of the usable screen: never a full-screen window. */
+    const val MAX_SCREEN_FRACTION = 0.9f
+
+    /** Slider ceiling in the settings app; the module still clamps to the screen. */
+    const val SLIDER_MAX_WIDTH_DP = 700
+    const val SLIDER_MAX_HEIGHT_DP = 1000
+
+    /** Clamps to [MIN_WIDTH_DP]..[maxWidthDp]; `maxDp` comes from the screen. */
+    fun clampWidth(widthDp: Int, maxWidthDp: Int): Int =
+        widthDp.coerceIn(MIN_WIDTH_DP, maxOf(MIN_WIDTH_DP, maxWidthDp))
+
+    /** Clamps to [MIN_HEIGHT_DP]..[maxHeightDp]; `maxDp` comes from the screen. */
+    fun clampHeight(heightDp: Int, maxHeightDp: Int): Int =
+        heightDp.coerceIn(MIN_HEIGHT_DP, maxOf(MIN_HEIGHT_DP, maxHeightDp))
+
+    /** The largest panel width, in dp, that fits [screenWidthPx] at [density]. */
+    fun maxWidthDp(screenWidthPx: Int, density: Float): Int =
+        (screenWidthPx * MAX_SCREEN_FRACTION / density.coerceAtLeast(0.1f)).toInt()
+
+    /** The largest panel height, in dp, that fits [screenHeightPx] at [density]. */
+    fun maxHeightDp(screenHeightPx: Int, density: Float): Int =
+        (screenHeightPx * MAX_SCREEN_FRACTION / density.coerceAtLeast(0.1f)).toInt()
 }
 
 /**

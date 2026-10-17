@@ -35,6 +35,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import io.github.wg1337.regtrail.shared.model.OverlayMechanism
+import io.github.wg1337.regtrail.shared.model.OverlaySizeLimits
 import io.github.wg1337.regtrail.shared.model.PaletteStyle
 import io.github.wg1337.regtrail.shared.model.ThemeConfig
 import io.github.wg1337.regtrail.ui.component.HsvColorPicker
@@ -205,6 +206,17 @@ private fun OverlayTab(
     systemHookAcknowledged: Boolean,
     onMechanismChange: (OverlayMechanism, Boolean) -> Unit,
 ) {
+    // Size limits, resolved once into the types `Slider` wants. The step count is
+    // derived from a 20 dp granularity so the slider reads in round numbers.
+    val minWidthDp = OverlaySizeLimits.MIN_WIDTH_DP.toFloat()
+    val maxWidthDp = OverlaySizeLimits.SLIDER_MAX_WIDTH_DP.toFloat()
+    val minHeightDp = OverlaySizeLimits.MIN_HEIGHT_DP.toFloat()
+    val maxHeightDp = OverlaySizeLimits.SLIDER_MAX_HEIGHT_DP.toFloat()
+    val widthSteps = ((OverlaySizeLimits.SLIDER_MAX_WIDTH_DP -
+        OverlaySizeLimits.MIN_WIDTH_DP) / 20) - 1
+    val heightSteps = ((OverlaySizeLimits.SLIDER_MAX_HEIGHT_DP -
+        OverlaySizeLimits.MIN_HEIGHT_DP) / 20) - 1
+
     // The mechanism choice first: it is a safety decision, and it determines
     // whether a system_server hook is installed at all.
     OverlayMechanismCard(
@@ -273,6 +285,43 @@ private fun OverlayTab(
                 value = config.overlayDefaultY,
                 onValueChange = { v -> onChange { it.copy(overlayDefaultY = v) } },
                 valueRange = 0f..1f,
+            )
+
+            // Size is a *published default*, not a live control: the window can
+            // also be dragged to a size inside the target app, and that choice is
+            // stored there. Publishing here is what resets it.
+            //
+            // The slider boundaries come from `OverlaySizeLimits` so the range the
+            // user can pick is exactly the range the module accepts. The stored
+            // value is coerced too: a config written by an older/newer build (or by
+            // hand) must not put the slider outside its own range.
+            LabeledValue("窗口宽度", "${config.overlayWidthDp} dp")
+            Slider(
+                value = config.overlayWidthDp.coerceIn(
+                    OverlaySizeLimits.MIN_WIDTH_DP,
+                    OverlaySizeLimits.SLIDER_MAX_WIDTH_DP,
+                ).toFloat(),
+                onValueChange = { v -> onChange { it.copy(overlayWidthDp = v.toInt()) } },
+                valueRange = minWidthDp..maxWidthDp,
+                steps = widthSteps,
+            )
+
+            LabeledValue("窗口高度", "${config.overlayHeightDp} dp")
+            Slider(
+                value = config.overlayHeightDp.coerceIn(
+                    OverlaySizeLimits.MIN_HEIGHT_DP,
+                    OverlaySizeLimits.SLIDER_MAX_HEIGHT_DP,
+                ).toFloat(),
+                onValueChange = { v -> onChange { it.copy(overlayHeightDp = v.toInt()) } },
+                valueRange = minHeightDp..maxHeightDp,
+                steps = heightSteps,
+            )
+            Text(
+                "最小 ${OverlaySizeLimits.MIN_WIDTH_DP}x" +
+                    "${OverlaySizeLimits.MIN_HEIGHT_DP} dp；模块会把超出屏幕 90% 的" +
+                    "尺寸压回可用范围。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }

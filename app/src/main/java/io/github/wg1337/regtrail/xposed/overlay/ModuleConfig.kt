@@ -5,6 +5,7 @@ import io.github.wg1337.regtrail.shared.bridge.BridgeApi
 import io.github.wg1337.regtrail.shared.bridge.SharedPaths
 import io.github.wg1337.regtrail.shared.model.ModuleConfigSnapshot
 import io.github.wg1337.regtrail.shared.model.OverlayMechanism
+import io.github.wg1337.regtrail.shared.model.OverlaySizeLimits
 import io.github.wg1337.regtrail.xposed.RegTrailLog
 import java.io.File
 
@@ -95,6 +96,9 @@ internal class ModuleConfig(private val module: XposedModule) {
         val overlayCornerDp: Int = 14,
         val overlayDefaultX: Float = 0.75f,
         val overlayDefaultY: Float = 0.25f,
+        /** Published starting size of the expanded panel, in dp. */
+        val overlayWidthDp: Int = OverlaySizeLimits.DEFAULT_WIDTH_DP,
+        val overlayHeightDp: Int = OverlaySizeLimits.DEFAULT_HEIGHT_DP,
         val panels: List<String> = listOf("status", "log"),
         val revision: Long = 0,
         val raw: ModuleConfigSnapshot = ModuleConfigSnapshot(),
@@ -138,6 +142,8 @@ internal class ModuleConfig(private val module: XposedModule) {
                 overlayCornerDp = model.overlayCornerDp,
                 overlayDefaultX = model.overlayDefaultX,
                 overlayDefaultY = model.overlayDefaultY,
+                overlayWidthDp = model.overlayWidthDp,
+                overlayHeightDp = model.overlayHeightDp,
                 panels = model.panels,
                 revision = model.revision,
                 raw = model,

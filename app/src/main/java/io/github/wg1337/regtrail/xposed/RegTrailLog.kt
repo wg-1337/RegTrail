@@ -98,6 +98,25 @@ internal object RegTrailLog {
         if (ring.size <= limit) ring.toList() else ring.toList().takeLast(limit)
     }
 
+    /** How many lines the in-memory ring can hold before the oldest is dropped. */
+    val capacity: Int get() = RING_SIZE
+
+    /**
+     * Empties the in-memory ring, for the window's 「清空日志」 button.
+     *
+     * Only the ring is cleared: the framework log and the spool file keep their
+     * history, because "clear the log" in this UI means "the panel is busy, start
+     * it over", not "destroy the evidence". The spool file also belongs to the
+     * settings app's tail view, which the user did not ask to clear.
+     *
+     * @return the number of lines that were dropped, so the UI can say so.
+     */
+    fun clear(): Int = synchronized(lock) {
+        val dropped = ring.size
+        ring.clear()
+        dropped
+    }
+
     private fun startWriter() {
         if (!started.compareAndSet(false, true)) return
         val t = Thread({ writerLoop() }, "regtrail-log")

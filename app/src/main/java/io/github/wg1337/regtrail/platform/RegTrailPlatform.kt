@@ -838,6 +838,12 @@ class RegTrailPlatform(
             overlayCornerDp = theme.overlayCornerDp,
             overlayDefaultX = theme.overlayDefaultX,
             overlayDefaultY = theme.overlayDefaultY,
+            // The published size is the *starting* size for every target app. A
+            // size the user dragged inside one app is remembered there and wins,
+            // until these two values change — publishing a new default is how the
+            // user resets a window they sized badly.
+            overlayWidthDp = theme.overlayWidthDp,
+            overlayHeightDp = theme.overlayHeightDp,
             panels = listOf("status", "log", "tools"),
             revision = System.currentTimeMillis(),
         )

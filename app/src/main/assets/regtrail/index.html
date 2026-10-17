@@ -28,6 +28,8 @@
         <dl id="status-list">
           <dt>宿主</dt><dd id="s-package">—</dd>
           <dt>窗口机制</dt><dd id="s-mechanism">—</dd>
+          <dt>窗口尺寸</dt><dd id="s-size">—</dd>
+          <dt>悬浮窗目标</dt><dd id="s-target-count">—</dd>
           <dt>框架</dt><dd id="s-framework">—</dd>
           <dt>API</dt><dd id="s-api">—</dd>
           <dt>作用域</dt><dd id="s-targets">—</dd>
@@ -37,7 +39,7 @@
           <button class="action" id="btn-hide">隐藏</button>
         </div>
         <p class="hint">
-          窗口位于目标应用进程内，不随 Activity 切换消失。
+          拖动右下角握柄可自由调整窗口大小；折叠后变成可拖动的胶囊，点击展开。
         </p>
       </section>
 
@@ -48,20 +50,27 @@
           <button class="action" id="btn-clear">清空</button>
           <button class="action" id="btn-copy">复制</button>
         </div>
+        <p class="hint" id="log-hint">正在读取模块日志…</p>
       </section>
 
       <!-- Tools -------------------------------------------------------- -->
       <section class="view" data-view="tools">
-        <p class="hint">
-          终端、实时调试与 Agent 工具在后续里程碑接入本面板。
-        </p>
-        <dl id="tools-list">
-          <dt>终端</dt><dd class="pending">未接入</dd>
-          <dt>实时调试</dt><dd class="pending">未接入</dd>
-          <dt>Agent</dt><dd class="pending">未接入</dd>
-        </dl>
+        <div class="row">
+          <button class="action" id="btn-tools-reload">重载配置</button>
+          <button class="action" id="btn-tools-clear">清空日志</button>
+        </div>
+        <div class="row">
+          <button class="action" id="btn-tools-scripts">列出脚本</button>
+          <button class="action" id="btn-tools-hide">隐藏窗口</button>
+        </div>
+        <div id="scripts"></div>
+        <p class="status-line" id="tools-status">就绪</p>
       </section>
     </main>
+
+    <!-- Resize affordance. The native side owns the real size: this only drags
+         and reports. Hidden by CSS whenever the window is collapsed. -->
+    <div id="grip" title="拖动调整窗口大小"></div>
   </div>
 
   <script src="app.js"></script>

@@ -41,6 +41,7 @@ html, body {
 }
 
 #panel {
+  position: relative;
   display: flex;
   flex-direction: column;
   width: 100%;
@@ -128,12 +129,69 @@ button.icon:active { background: rgba(255, 255, 255, 0.08); }
   display: none;
   position: absolute;
   inset: 0;
-  padding: 10px;
+  /* Bottom padding keeps the last row of buttons clear of the resize grip, whose
+     touch target sits in the bottom-right 28 px of the panel. Content ends 30 px
+     above the edge, so the two never overlap and a tap near the corner still
+     reaches the button. */
+  padding: 10px 10px 30px;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
 
 .view.active { display: block; }
+
+/* ---- Resize grip ----------------------------------------------------- */
+/*
+ * The grip is the whole resize affordance: it drags the window's bottom-right
+ * corner and posts a `resize` message to native code, which owns the actual
+ * window size. The visible part is drawn with gradients only — no image, no font
+ * — because the window's CSP allows `img-src 'self' data:` and nothing else.
+ *
+ * The element is deliberately larger (34 dp) than the stripes it draws (18 dp):
+ * the stripes are the affordance, but the *touch target* is what makes the drag
+ * reliable with a fingertip.
+ *
+ * `touch-action: none` is required: without it the WebView treats a drag that
+ * starts here as a scroll gesture and the pointer move stream stops arriving.
+ */
+#grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 28px;
+  height: 28px;
+  z-index: 10;
+  cursor: nwse-resize;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#grip::after {
+  content: "";
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 16px;
+  height: 16px;
+  opacity: 0.55;
+  border-bottom-right-radius: var(--radius);
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.85) 0 1px,
+    transparent 1px 5px
+  );
+}
+
+#grip:active::after,
+body.dragging #grip::after { opacity: 1; }
+
+/*
+ * Collapsed: the window is a pill and *must not* be resizable. Hiding the grip is
+ * the visible half of that rule; `OverlayController` also refuses a `resize`
+ * message while collapsed, so a stale page cannot break the pill.
+ */
+body.collapsed #grip { display: none; }
 
 /* ---- Definition lists ------------------------------------------------ */
 dl {
@@ -200,6 +258,66 @@ button.action:active {
   font-size: calc(10.5px * var(--regtrail-font-scale));
   margin: 6px 0 0;
 }
+
+/* ---- Tools: script list ---------------------------------------------- */
+#scripts { margin-top: 4px; }
+
+.script {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.script:last-child { border-bottom: none; }
+
+.script .name {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-all;
+}
+
+.script .meta {
+  display: block;
+  color: var(--fg-dim);
+  font-size: calc(10px * var(--regtrail-font-scale));
+}
+
+.script .run {
+  flex: 0 0 auto;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-size: calc(11px * var(--regtrail-font-scale));
+  cursor: pointer;
+}
+
+.script .run:active {
+  background: var(--regtrail-primary);
+  color: #101014;
+  border-color: var(--regtrail-primary);
+}
+
+.script.empty {
+  color: var(--fg-dim);
+  font-size: calc(10.5px * var(--regtrail-font-scale));
+  font-style: italic;
+}
+
+/* Result line for the tools tab. Kept to one short status so a failed action is
+   always visible without pushing the buttons out of the panel. */
+.status-line {
+  margin: 8px 0 0;
+  min-height: 1.4em;
+  font-size: calc(10.5px * var(--regtrail-font-scale));
+  color: var(--regtrail-primary);
+  word-break: break-all;
+}
+
+.status-line.error { color: #ff7b72; }
 
 /* ---- Scrollbar ------------------------------------------------------- */
 ::-webkit-scrollbar { width: 3px; }
