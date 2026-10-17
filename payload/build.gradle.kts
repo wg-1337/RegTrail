@@ -133,9 +133,9 @@ val payloadD8Jar: File = run {
 }
 
 val payloadClassesDir = layout.buildDirectory.dir("payloadClasses")
-val payloadAssetsDir = rootProject.layout.buildDirectory.dir("payload-assets")
-val payloadAssetsDirFile = payloadAssetsDir.get().asFile
-val payloadDexFile = File(payloadAssetsDirFile, "regtrail/payload.dex")
+val payloadJarDir = layout.buildDirectory.dir("payloadJar")
+val payloadD8Archive = layout.buildDirectory.file("payload-d8.zip")
+val payloadAssetsDirFile = rootProject.layout.buildDirectory.dir("payload-assets").get().asFile
 
 /** Compiles the payload sources against `android.jar` at Java 11 / no Kotlin. */
 val compilePayload = tasks.register<JavaCompile>("compilePayloadJava") {
@@ -153,54 +153,74 @@ val compilePayload = tasks.register<JavaCompile>("compilePayloadJava") {
 }
 
 /**
- * Dexes [compilePayload]'s class files into `<root>/build/payload-assets/regtrail/payload.dex`.
+ * Packs the compiled classes into a jar.
  *
- * d8 (`--min-api 28`) is invoked in-process via [JavaExec]; the produced
- * `classes.dex` is renamed to `payload.dex` so that the asset name states what it
- * is (`payload.dex` is the file the patcher looks for). `--release` is
- * intentionally not passed: keeping line numbers makes an on-device payload crash
- * readable in logcat.
+ * d8 accepts class files, jars and zips as program input, but explicitly *not* a
+ * directory ("Unsupported source file type"), so the jar is what makes the d8 step
+ * work at all.
+ */
+val jarPayloadClasses = tasks.register<Jar>("jarPayloadClasses") {
+    group = "payload"
+    description = "Packs the compiled payload classes into a jar for d8."
+
+    dependsOn(compilePayload)
+    archiveFileName.set("payload-classes.jar")
+    destinationDirectory.set(payloadJarDir)
+    from(payloadClassesDir)
+    include("**/*.class")
+}
+
+/**
+ * Dexes the payload jar with the platform d8 (`--min-api 28`).
+ *
+ * The output is a `.zip` holding `classes.dex` because d8 requires its output to
+ * either exist already (directory) or be an archive — an archive needs no
+ * pre-created directory, so the task stays a plain [JavaExec] with no script-level
+ * `doFirst`/`doLast` closure (which the configuration cache rejects in build
+ * scripts). `--release` is intentionally not passed: keeping line numbers makes an
+ * on-device payload crash readable in logcat.
  */
 val dexPayload = tasks.register<JavaExec>("dexPayload") {
     group = "payload"
-    description = "Dexes the payload into payload.dex and stages it as a RegTrail asset."
+    description = "Runs d8 over the payload jar, producing a zip that contains classes.dex."
 
-    dependsOn(compilePayload)
-    inputs.dir(payloadClassesDir)
+    dependsOn(jarPayloadClasses)
+    inputs.files(payloadJarDir.map { it.file("payload-classes.jar") })
     inputs.file(payloadD8Jar)
     inputs.file(payloadAndroidJar)
-    outputs.file(payloadDexFile)
+    outputs.file(payloadD8Archive)
 
     classpath = files(payloadD8Jar)
     mainClass.set("com.android.tools.r8.D8")
     args = listOf(
         "--min-api", "28",
         "--lib", payloadAndroidJar.absolutePath,
-        "--output", payloadAssetsDirFile.absolutePath,
-        payloadClassesDir.get().asFile.absolutePath,
+        "--output", payloadD8Archive.get().asFile.absolutePath,
+        payloadJarDir.get().asFile.resolve("payload-classes.jar").absolutePath,
     )
+}
 
-    doLast {
-        val produced = File(payloadAssetsDirFile, "classes.dex")
-        check(produced.isFile) {
-            "d8 did not produce classes.dex in $payloadAssetsDirFile"
-        }
-        payloadDexFile.parentFile?.mkdirs()
-        if (payloadDexFile.exists()) {
-            payloadDexFile.delete()
-        }
-        check(produced.renameTo(payloadDexFile)) {
-            "could not rename $produced to $payloadDexFile"
-        }
-        logger.lifecycle(
-            "payload.dex: {} bytes -> {}",
-            payloadDexFile.length(),
-            payloadDexFile.absolutePath,
-        )
-    }
+/**
+ * Stages the dex at `<root>/build/payload-assets/regtrail/payload.dex`.
+ *
+ * That path is what `:app` registers as an extra asset root, so the file lands in
+ * the settings APK as `assets/regtrail/payload.dex` — the exact name [ApkPatcher]
+ * looks for. Renaming here (instead of `classes.dex`) is deliberate: inside a
+ * patched APK the file *becomes* `classesN.dex`, so `payload.dex` is the only name
+ * that says what the asset is for someone inspecting the APK later.
+ */
+val stagePayloadDex = tasks.register<Copy>("stagePayloadDex") {
+    group = "payload"
+    description = "Stages payload.dex into the shared asset directory consumed by :app."
+
+    dependsOn(dexPayload)
+    from(zipTree(payloadD8Archive))
+    include("classes.dex")
+    rename("classes\\.dex", "payload.dex")
+    into(File(payloadAssetsDirFile, "regtrail"))
 }
 
 // `:payload:assemble` produces the artifact that `:app` actually consumes.
 tasks.named("assemble") {
-    dependsOn(dexPayload)
+    dependsOn(stagePayloadDex)
 }

@@ -10,6 +10,10 @@ import io.github.wg1337.regtrail.bridge.ModuleBridgeClient
 import io.github.wg1337.regtrail.config.ConfigPublisher
 import io.github.wg1337.regtrail.data.ThemeConfigStore
 import io.github.wg1337.regtrail.detect.EnvironmentDetector
+import io.github.wg1337.regtrail.patch.PatchRecord
+import io.github.wg1337.regtrail.patch.PatchRepository
+import io.github.wg1337.regtrail.patch.PatchStage
+import io.github.wg1337.regtrail.patch.PatchTarget
 import io.github.wg1337.regtrail.scope.AppCatalog
 import io.github.wg1337.regtrail.scope.ScopeManager
 import io.github.wg1337.regtrail.shared.model.ModuleConfigSnapshot
@@ -27,6 +31,9 @@ import io.github.wg1337.regtrail.ui.debug.DebugMessageUi
 import io.github.wg1337.regtrail.ui.debug.DebugUiState
 import io.github.wg1337.regtrail.ui.debug.HookItemUi
 import io.github.wg1337.regtrail.ui.debug.MethodItemUi
+import io.github.wg1337.regtrail.ui.patch.PatchRecordUi
+import io.github.wg1337.regtrail.ui.patch.PatchTargetUi
+import io.github.wg1337.regtrail.ui.patch.PatchUiState
 import io.github.wg1337.regtrail.ui.terminal.TerminalEntry
 import io.github.wg1337.regtrail.ui.terminal.TerminalMode
 import io.github.wg1337.regtrail.ui.terminal.TerminalUiState
@@ -600,6 +607,153 @@ class RegTrailPlatform(
     }
 
     // -----------------------------------------------------------------------
+    // Persistent injection (P6)
+    // -----------------------------------------------------------------------
+
+    private val patchRepository = PatchRepository(context)
+
+    private val _patchState = MutableStateFlow(PatchUiState())
+    val patchStateFlow: StateFlow<PatchUiState> = _patchState.asStateFlow()
+
+    override fun patchState(): PatchUiState = _patchState.value
+
+    /**
+     * Re-enumerates installed apps and re-reads the produced-APK records.
+     *
+     * Runs on `Dispatchers.IO`: enumerating ~150 packages through `PackageManager`
+     * plus stat-ing each APK is fast but not free, and doing it on the main thread
+     * on screen entry was visible as a stutter on the scope screen already.
+     */
+    override fun refreshPatchTargets() {
+        if (_patchState.value.loading) return
+        _patchState.value = _patchState.value.copy(loading = true)
+        bumpRevision()
+
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    Triple(
+                        patchRepository.listTargets(),
+                        patchRepository.loadRecords(),
+                        patchRepository.signerFingerprint(),
+                    )
+                }
+            }
+
+            result.fold(
+                onSuccess = { (targets, records, fingerprint) ->
+                    _patchState.value = _patchState.value.copy(
+                        loading = false,
+                        targets = targets.map { it.toUi() },
+                        records = records.map { it.toUi() },
+                        signerFingerprint = fingerprint,
+                    )
+                },
+                onFailure = { t ->
+                    _patchState.value = _patchState.value.copy(
+                        loading = false,
+                        message = "读取应用列表失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    /**
+     * Runs the patcher in the background and publishes progress as it goes.
+     *
+     * The stage callback fires on the IO thread; publishing it straight into the
+     * `StateFlow` (plus a revision bump) is what lets the screen show "正在改写
+     * AndroidManifest.xml" while the work is still happening, instead of a spinner
+     * that could equally mean "hung".
+     */
+    override fun generatePatchedApk(packageName: String) {
+        if (_patchState.value.busy) return
+
+        val label = _patchState.value.targets.firstOrNull { it.packageName == packageName }?.label
+        _patchState.value = _patchState.value.copy(
+            busy = true,
+            activePackage = packageName,
+            activeLabel = label,
+            stage = PatchStage.Resolve.label,
+            message = null,
+            messageIsError = false,
+        )
+        bumpRevision()
+
+        scope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching {
+                    patchRepository.patch(packageName) { stage, detail ->
+                        _patchState.value = _patchState.value.copy(
+                            stage = if (detail.isNullOrBlank()) stage.label else "${stage.label}：$detail",
+                        )
+                        bumpRevision()
+                    }
+                }
+            }
+
+            outcome.fold(
+                onSuccess = { record ->
+                    val records = withContext(Dispatchers.IO) {
+                        runCatching { patchRepository.loadRecords() }.getOrDefault(emptyList())
+                    }
+                    _patchState.value = _patchState.value.copy(
+                        busy = false,
+                        activePackage = null,
+                        activeLabel = null,
+                        stage = null,
+                        records = records.map { it.toUi() },
+                        signerFingerprint = record.signerSha256,
+                        message = "已生成：${record.path}",
+                        messageIsError = false,
+                    )
+                },
+                onFailure = { t ->
+                    Log.e(TAG, "patch failed for $packageName", t)
+                    _patchState.value = _patchState.value.copy(
+                        busy = false,
+                        activePackage = null,
+                        activeLabel = null,
+                        stage = null,
+                        message = "打包失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    override fun deletePatchedApk(path: String) {
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    patchRepository.deleteRecord(path) to patchRepository.loadRecords()
+                }
+            }
+            result.fold(
+                onSuccess = { (deleted, records) ->
+                    _patchState.value = _patchState.value.copy(
+                        records = records.map { it.toUi() },
+                        message = if (deleted) "已删除补丁文件" else "文件已不存在，已从记录中移除",
+                        messageIsError = false,
+                    )
+                },
+                onFailure = { t ->
+                    _patchState.value = _patchState.value.copy(
+                        message = "删除失败：${t.message ?: t::class.java.simpleName}",
+                        messageIsError = true,
+                    )
+                },
+            )
+            bumpRevision()
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Root
     // -----------------------------------------------------------------------
 
@@ -797,6 +951,32 @@ private fun AgentConfig.toUi(): AgentConfigUi = AgentConfigUi(
     model = model,
     hasApiKey = apiKey.isNotBlank(),
     maxToolRounds = maxToolRounds,
+)
+
+// ---------------------------------------------------------------------------
+// P6 — cross-module translation for the packaging screen
+// ---------------------------------------------------------------------------
+
+private fun PatchTarget.toUi(): PatchTargetUi = PatchTargetUi(
+    packageName = packageName,
+    label = label,
+    isSystem = isSystem,
+    minSdk = minSdk,
+    targetSdk = targetSdk,
+    apkBytes = apkBytes,
+    splitCount = splitCount,
+    minSdkWillBeRaised = minSdkWillBeRaised,
+)
+
+private fun PatchRecord.toUi(): PatchRecordUi = PatchRecordUi(
+    packageName = packageName,
+    label = label,
+    path = path,
+    bytes = bytes,
+    createdAt = createdAt,
+    injectedDexEntry = injectedDexEntry,
+    signerSha256 = signerSha256,
+    warnings = warnings,
 )
 
 /** Log tag for the settings-side diagnostics. */

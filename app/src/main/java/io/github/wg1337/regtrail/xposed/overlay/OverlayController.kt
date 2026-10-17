@@ -13,6 +13,9 @@ import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 import io.github.wg1337.regtrail.shared.bridge.BridgeApi
 import io.github.wg1337.regtrail.xposed.RegTrailLog
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import io.github.wg1337.regtrail.xposed.script.ScriptEngine
 import io.github.wg1337.regtrail.xposed.script.ScriptLifecycleBridge
 import io.github.wg1337.regtrail.xposed.RegTrailModule
 import io.github.wg1337.regtrail.xposed.bridge.AgentTools
@@ -23,7 +26,6 @@ import io.github.wg1337.regtrail.xposed.debug.DebugEngine
 import io.github.wg1337.regtrail.xposed.debug.InstanceRegistry
 import io.github.wg1337.regtrail.xposed.hook.TargetRegistry
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 
@@ -49,8 +51,8 @@ import kotlinx.serialization.json.buildJsonObject
  *
  * ## When the context arrives
  * All of this needs the target app's `Context`. Rather than guessing at
- * `ContextImpl` internals, the controller hooks `Application.attach(Context)` �?
- * a stable, public, early entry point that hands us the real `Context` �?and
+ * `ContextImpl` internals, the controller hooks `Application.attach(Context)` —
+ * a stable, public, early entry point that hands us the real `Context` — and
  * builds the window from there. If the Application was already created before
  * we were loaded (common for `onPackageLoaded`, which fires after
  * `attachBaseContext`), the well-known
@@ -117,7 +119,7 @@ internal class OverlayController(
         // line usually answers it without a round trip.
         val snapshot = config.snapshot()
         RegTrailLog.i(
-            "${param.packageName}: evaluated �?enabled=${snapshot.enabled}, " +
+            "${param.packageName}: evaluated — enabled=${snapshot.enabled}, " +
                 "attachAllScoped=${snapshot.attachAllScoped}, " +
                 "targets=${snapshot.targetPackages.size}, " +
                 "mechanism=${snapshot.overlayMechanism}, " +
@@ -131,10 +133,10 @@ internal class OverlayController(
         }
 
         if (!config.isOverlayTarget(param.packageName)) {
-            skipReason = "本应用未勾选「悬浮窗�?
+            skipReason = "本应用未勾选「悬浮窗」"
             RegTrailLog.i(
                 "${param.packageName}: not an overlay target " +
-                    "(tick its 悬浮�?checkbox in RegTrail �?目标)",
+                    "(tick its 悬浮窗 checkbox in RegTrail → 目标)",
             )
             return
         }
@@ -162,7 +164,7 @@ internal class OverlayController(
                 }
             RegTrailLog.d("${param.packageName}: waiting for Application.attach(Context)")
         } catch (t: Throwable) {
-            skipReason = "无法 Hook Application.attach�?{t.message}"
+            skipReason = "无法 Hook Application.attach：${t.message}"
             RegTrailLog.w("${param.packageName}: cannot hook Application.attach", t)
         }
     }
@@ -176,9 +178,9 @@ internal class OverlayController(
         (app as? Application)?.let { ActivityTracker.register(it) }
 
         // Recorded scripts run even when the window is disabled: they are a
-        // debugging feature in their own right (see docs/PLAN.md 5-�?.
+        // debugging feature in their own right (see docs/PLAN.md 5-③).
         (app as? Application)?.let {
-            ScriptLifecycleBridge.install(module, it, param.classLoader)
+            ScriptLifecycleBridge.install(module, it, context.classLoader)
         }
 
         if (attached) return
@@ -222,7 +224,7 @@ internal class OverlayController(
         TargetRegistry.setConfiguredTargets(snapshot.targetPackages)
 
         // Mechanism selection. DecorView is the default because it needs no
-        // permission and, crucially, no system_server hook �?so it cannot put the
+        // permission and, crucially, no system_server hook — so it cannot put the
         // device into a bootloop.
         if (!snapshot.useSystemOverlay) {
             RegTrailLog.i(
@@ -290,7 +292,7 @@ internal class OverlayController(
     /**
      * Degraded path: put the overlay inside the current Activity.
      *
-     * Reuses [DecorOverlayFallback], which re-attaches on every Activity resume �?
+     * Reuses [DecorOverlayFallback], which re-attaches on every Activity resume —
      * that is what makes it look persistent even though each Activity gets a
      * fresh view.
      */
@@ -370,7 +372,7 @@ internal class OverlayController(
     }
 
     // -----------------------------------------------------------------------
-    // ModuleSession �?what the bridge provider in this process can do
+    // ModuleSession — what the bridge provider in this process can do
     // -----------------------------------------------------------------------
 
     override fun reloadConfig() {

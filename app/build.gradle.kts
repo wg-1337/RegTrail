@@ -92,11 +92,11 @@ androidComponents {
 
 tasks.configureEach {
     if (name.startsWith("merge") && name.endsWith("Assets")) {
-        dependsOn(":payload:dexPayload")
+        dependsOn(":payload:stagePayloadDex")
     }
 }
 tasks.matching { it.name == "preBuild" }.configureEach {
-    dependsOn(":payload:dexPayload")
+    dependsOn(":payload:stagePayloadDex")
 }
 
 dependencies {

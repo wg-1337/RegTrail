@@ -24,10 +24,12 @@ import io.github.wg1337.regtrail.shared.model.SelfCheckReport
 import io.github.wg1337.regtrail.ui.agent.AgentUiState
 import io.github.wg1337.regtrail.ui.debug.DebugUiState
 import io.github.wg1337.regtrail.ui.nav.Dest
+import io.github.wg1337.regtrail.ui.patch.PatchUiState
 import io.github.wg1337.regtrail.ui.screen.AgentScreen
 import io.github.wg1337.regtrail.ui.screen.AppearanceScreen
 import io.github.wg1337.regtrail.ui.screen.DebugScreen
 import io.github.wg1337.regtrail.ui.screen.HomeScreen
+import io.github.wg1337.regtrail.ui.screen.PatchScreen
 import io.github.wg1337.regtrail.ui.screen.ScopeScreen
 import io.github.wg1337.regtrail.ui.screen.SelfCheckScreen
 import io.github.wg1337.regtrail.ui.screen.TerminalScreen
@@ -117,6 +119,30 @@ interface PlatformBridge {
     fun sendAgentMessage(text: String)
     fun resetAgent()
     fun saveAgentConfig(baseUrl: String, apiKey: String, model: String, rounds: Int)
+
+    // ---- Persistent injection (P6) -----------------------------------------
+    /**
+     * Snapshot of the no-root packaging screen: patchable apps, produced APKs and
+     * whatever the patcher is doing right now.
+     *
+     * Like every other `*State()` accessor this is a synchronous pull; the UI
+     * re-reads it whenever [stateRevision] changes.
+     */
+    fun patchState(): PatchUiState
+
+    /** Re-enumerates installed apps; cheap enough to run on every screen entry. */
+    fun refreshPatchTargets()
+
+    /**
+     * Patches [packageName] and writes a signed APK.
+     *
+     * Asynchronous on purpose: the caller is a Compose click handler. Progress and
+     * the result arrive through [patchState].
+     */
+    fun generatePatchedApk(packageName: String)
+
+    /** Deletes a produced APK and forgets it. */
+    fun deletePatchedApk(path: String)
 }
 
 /**
@@ -134,6 +160,7 @@ fun RegTrailApp(
     var debugState by remember { mutableStateOf(platform.debugState()) }
     var agentState by remember { mutableStateOf(platform.agentState()) }
     var rootState by remember { mutableStateOf(platform.rootState()) }
+    var patchState by remember { mutableStateOf(platform.patchState()) }
     var revision by remember { mutableStateOf(platform.stateRevision()) }
     val scope = rememberCoroutineScope()
 
@@ -151,6 +178,7 @@ fun RegTrailApp(
                 debugState = platform.debugState()
                 agentState = platform.agentState()
                 rootState = platform.rootState()
+                patchState = platform.patchState()
             }
             kotlinx.coroutines.delay(250)
         }
@@ -174,6 +202,7 @@ fun RegTrailApp(
         debugState = platform.debugState()
         agentState = platform.agentState()
         rootState = platform.rootState()
+        patchState = platform.patchState()
     }
 
     LaunchedEffect(Unit) {
@@ -220,6 +249,13 @@ fun RegTrailApp(
                                     }
                                     Dest.Terminal -> {
                                         terminalState = platform.terminalState()
+                                    }
+                                    Dest.Patch -> {
+                                        // Enumerating installed apps is the slow
+                                        // part of this screen, so refresh on entry
+                                        // rather than on every recomposition.
+                                        platform.refreshPatchTargets()
+                                        patchState = platform.patchState()
                                     }
                                     else -> Unit
                                 }
@@ -357,6 +393,24 @@ fun RegTrailApp(
                         onSaveConfig = { baseUrl, apiKey, model, rounds ->
                             platform.saveAgentConfig(baseUrl, apiKey, model, rounds)
                             agentState = platform.agentState()
+                        },
+                    )
+                }
+
+                composable(Dest.Patch.route) {
+                    PatchScreen(
+                        state = patchState,
+                        onRefresh = {
+                            platform.refreshPatchTargets()
+                            patchState = platform.patchState()
+                        },
+                        onGenerate = { packageName ->
+                            platform.generatePatchedApk(packageName)
+                            patchState = platform.patchState()
+                        },
+                        onDeleteRecord = { path ->
+                            platform.deletePatchedApk(path)
+                            patchState = platform.patchState()
                         },
                     )
                 }
