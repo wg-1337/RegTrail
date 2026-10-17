@@ -242,7 +242,7 @@ internal class ApkPatcher(
         warnings: MutableList<String>,
         onStage: (PatchStage, String?) -> Unit,
     ): Prepared {
-        val overlayEntryNames = overlayAssets.mapTo(HashSet()) { (path, _) -> path }
+        val overlayEntryNames = overlayAssets.mapTo(HashSet()) { (path, _) -> "$ASSETS_PREFIX$path" }
 
         ZipFile(sourceApk).use { source ->
             val manifestEntry = source.getEntry(MANIFEST_ENTRY)
@@ -305,7 +305,13 @@ internal class ApkPatcher(
                 onStage(PatchStage.Inject, dexEntryName)
                 writeBytes(output, dexEntryName, payloadDex)
                 for ((assetPath, bytes) in overlayAssets) {
-                    writeBytes(output, assetPath, bytes)
+                    // The APK entry must live under `assets/`; `context.getAssets()`
+                    // resolves names relative to that directory. Writing the bare
+                    // `regtrail/…` path (as an earlier version did) put the files at
+                    // the APK root, so the payload could not open its own UI and the
+                    // patched app came up with an invisible window. Caught by
+                    // inspecting a real patched APK on device.
+                    writeBytes(output, "$ASSETS_PREFIX$assetPath", bytes)
                 }
             }
 
@@ -438,6 +444,8 @@ internal class ApkPatcher(
         const val DEX_SUFFIX = ".dex"
 
         /** Payload assets live in our own APK under this directory. */
+        /** Every APK asset entry lives under this prefix; `AssetManager` strips it. */
+        const val ASSETS_PREFIX = "assets/"
         const val OVERLAY_ASSET_DIR = "regtrail"
         const val PAYLOAD_DEX_ASSET = "$OVERLAY_ASSET_DIR/payload.dex"
         val OVERLAY_ASSET_NAMES = listOf("index.html", "style.css", "app.js")
