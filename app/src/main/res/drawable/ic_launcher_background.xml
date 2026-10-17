@@ -1,0 +1,51 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!--
+      Adaptive-icon background.
+
+      A near-black navy gradient rather than a flat colour: the foreground mark is
+      a thin mint trail, and on a flat mid-tone it disappeared at 48 dp in the
+      launcher. The gradient also survives the various launcher masks (circle,
+      squircle, rounded square) because it runs diagonally and has no edge to
+      expose.
+
+      Full-bleed on purpose: the background layer is *not* clipped to the 66 dp
+      safe zone — only the foreground is — so it must cover the whole 108 dp
+      viewport.
+    -->
+    <path android:pathData="M0,0h108v108h-108z">
+        <aapt:attr xmlns:aapt="http://schemas.android.com/aapt" name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="18"
+                android:startY="12"
+                android:endX="92"
+                android:endY="98">
+                <item android:offset="0.0" android:color="#FF1B2536" />
+                <item android:offset="0.55" android:color="#FF121826" />
+                <item android:offset="1.0" android:color="#FF090C12" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!--
+      A very low-contrast radial glow behind the mark, so the icon has a focal
+      point instead of looking like a sticker on a black tile.
+    -->
+    <path android:pathData="M54,54m-46,0a46,46 0 1,0 92,0a46,46 0 1,0 -92,0">
+        <aapt:attr xmlns:aapt="http://schemas.android.com/aapt" name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="66"
+                android:centerY="44"
+                android:gradientRadius="46">
+                <item android:offset="0.0" android:color="#337DE2C3" />
+                <item android:offset="1.0" android:color="#007DE2C3" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>
