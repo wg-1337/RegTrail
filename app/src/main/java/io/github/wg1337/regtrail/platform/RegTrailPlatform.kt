@@ -871,9 +871,9 @@ class RegTrailPlatform(
             agentModel = agent.model,
             agentApiKey = agent.apiKey,
             agentMaxRounds = agent.maxToolRounds,
-            // `mem` and `agent` are the tabs the panel gained; the page hides any
-            // tab this list does not name, so a stale publish means "no 内存 tab".
-            panels = listOf("status", "log", "tools", "mem", "agent"),
+            // `mem`, `debug` and `agent` are the tabs the panel gained; the page hides
+            // any tab this list does not name, so a stale publish means "no 内存 tab".
+            panels = listOf("status", "log", "tools", "mem", "debug", "agent"),
             revision = System.currentTimeMillis(),
         )
 

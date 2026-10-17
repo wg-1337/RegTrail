@@ -21,6 +21,7 @@
       <button class="tab" data-tab="log">日志</button>
       <button class="tab" data-tab="tools">工具</button>
       <button class="tab" data-tab="mem">内存</button>
+      <button class="tab" data-tab="debug">调试</button>
       <button class="tab" data-tab="agent">Agent</button>
     </nav>
 
@@ -95,6 +96,16 @@
           <button class="action" id="btn-mem-scan">首次扫描</button>
           <button class="action" id="btn-mem-refine">再次扫描</button>
         </div>
+        <!--
+          「诊断」 is the answer path for "内存搜索不可用": it reports, from inside the
+          host process, whether /proc/self/maps parses, how many regions survive the
+          filter, whether /proc/self/mem opens for read and for write (with the errno),
+          and one sample page read through every transport this ROM allows.
+        -->
+        <div class="row">
+          <button class="action" id="btn-mem-probe">诊断（内存为什么不可用）</button>
+        </div>
+        <pre id="mem-probe-out" class="console-out" style="display:none"></pre>
         <label class="check">
           <input type="checkbox" id="mem-writable">
           只搜可写内存（默认关：代码段里的常量也要能搜到）
@@ -106,6 +117,37 @@
           <button class="action" id="btn-mem-clear">清空搜索结果</button>
           <button class="action" id="btn-mem-revert-all" disabled>还原全部修改（0）</button>
         </div>
+      </section>
+
+      <!-- Debug -------------------------------------------------------- -->
+      <!--
+        Real-time method debugging, from the floating window.
+
+        Search a class or method name, pick one of the overloads (the parameter types
+        are shown, because `login(String)` and `login(String,String)` are different
+        hooks), press 「监听」 and watch the calls arrive: each row shows the argument
+        values and the return value, with a timestamp and the thread name. The engine
+        records into a bounded ring (200 entries per hook, newest kept) and the page
+        renders at most 150 rows, so a hot method cannot grow the panel without bound.
+      -->
+      <section class="view" data-view="debug">
+        <div class="row">
+          <input class="input" id="debug-query" type="text" autocomplete="off"
+                 autocorrect="off" spellcheck="false"
+                 placeholder="类名或方法名，如 Login 或 com…Activity#onCreate">
+          <button class="action narrow" id="btn-debug-search">搜索</button>
+        </div>
+        <p class="status-line" id="debug-status">就绪</p>
+        <div id="debug-methods"></div>
+        <div id="debug-hooks"></div>
+        <div id="debug-calls"></div>
+        <div class="row" style="margin-top:8px">
+          <button class="action" id="btn-debug-clear">清空调用记录</button>
+        </div>
+        <p class="hint">
+          点某个方法后的「监听」开始记录：每次调用都会显示<b>参数</b>与<b>返回值</b>。
+          Hook 以 PROTECTIVE 模式安装，记录本身不会改变宿主行为；随时可以「解除」。
+        </p>
       </section>
 
       <!-- Agent -------------------------------------------------------- -->

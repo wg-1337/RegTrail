@@ -58,6 +58,16 @@ internal class DecorOverlayFallback(
     private var currentView: FloatingOverlayView? = null
     private var registered = false
 
+    /**
+     * Margins a previous run dragged the panel to, in pixels.
+     *
+     * Consumed once, on the first attach; [OverlayController] reads them from
+     * `OverlaySizeStore` so a dragged position survives the target process being
+     * killed. They are clamped to the container as soon as it has been laid out —
+     * a value saved on a larger screen must never leave the panel unreachable.
+     */
+    private var restoredMargins: Pair<Int, Int>? = null
+
     /** Mirrors [FloatingOverlayView.isCollapsed]; decides which size to apply. */
     private var collapsed = false
 
@@ -85,6 +95,16 @@ internal class DecorOverlayFallback(
     /** The activity the overlay is currently attached to. */
     private var hostActivity: Activity? = null
 
+    /**
+     * Margin pair (top, end) at the moment a header drag started.
+     *
+     * Kept here rather than in the controller because only this class knows how a
+     * position maps onto `FrameLayout` margins (the panel is laid out with
+     * `Gravity.TOP or Gravity.END`, so moving right *decreases* `marginEnd`).
+     */
+    private var dragOriginTopPx = 0
+    private var dragOriginEndPx = 0
+
     @Volatile
     private var onMessage: ((String, String) -> String?)? = null
 
@@ -102,9 +122,13 @@ internal class DecorOverlayFallback(
         app: Application,
         handler: (String, String) -> String?,
         onCollapsed: (Boolean) -> Unit = {},
+        savedMargins: Pair<Int, Int>? = null,
     ) {
         onMessage = handler
         onCollapsedToggle = onCollapsed
+        if (savedMargins != null && marginTopPx < 0) {
+            restoredMargins = savedMargins
+        }
         if (registered) return
         registered = true
 
@@ -200,8 +224,15 @@ internal class DecorOverlayFallback(
         // likely to cover primary content. The size comes from the controller so
         // a remembered drag (or the settings app's slider) is honoured on every
         // re-attach, not just on the first one.
-        if (marginTopPx < 0) marginTopPx = dp(context, MARGIN_TOP_DP)
-        if (marginEndPx < 0) marginEndPx = dp(context, MARGIN_END_DP)
+        if (marginTopPx < 0) {
+            val restored = restoredMargins
+            marginTopPx = restored?.first ?: dp(context, MARGIN_TOP_DP)
+        }
+        if (marginEndPx < 0) {
+            val restored = restoredMargins
+            marginEndPx = restored?.second ?: dp(context, MARGIN_END_DP)
+        }
+        restoredMargins = null
 
         val params = FrameLayout.LayoutParams(
             dp(context, sizeDp().first.toFloat()),
@@ -221,6 +252,12 @@ internal class DecorOverlayFallback(
 
         currentContainer = container
         currentView = view
+
+        // A position restored from preferences — or simply a rotation since it was
+        // saved — may put the panel outside the new container. Clamp once the
+        // container has real bounds, otherwise the window could end up somewhere
+        // the user cannot reach (this mechanism has no other entry point).
+        container.post { clampIntoContainer() }
 
         // A freshly built view starts expanded. Restore the collapsed state so an
         // Activity change while collapsed does not pop the panel open inside a
@@ -314,6 +351,12 @@ internal class DecorOverlayFallback(
         lp.width = dp(context, size.first.toFloat())
         lp.height = dp(context, size.second.toFloat())
         view.layoutParams = lp
+        // Growing from the pill back to the panel is a *size* change, and the position
+        // was clamped against the pill's size while collapsed. A panel dragged near a
+        // container edge would therefore expand half outside the Activity window —
+        // measured on the test device: the title bar's first inch and the 状态 tab were
+        // clipped away. Re-clamp once this new size has been laid out.
+        view.post { clampIntoContainer() }
     }
 
     /**
@@ -344,6 +387,121 @@ internal class DecorOverlayFallback(
         lp.topMargin = marginTopPx
         lp.marginEnd = marginEndPx
         view.layoutParams = lp
+    }
+
+    // -----------------------------------------------------------------------
+    // Header drag (the expanded panel's title bar)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Remembers the current position as the origin of a header drag.
+     *
+     * Called once per gesture from the controller, so the frame-by-frame path
+     * ([dragToDp]) is pure arithmetic: the page sends the *total* delta since the
+     * finger went down, and this class turns it into an absolute margin pair. That
+     * is what makes clamping idempotent — asking for 500 dp twice gives the same
+     * answer as asking once, so a dropped or reordered frame cannot drift.
+     */
+    fun beginDrag() {
+        dragOriginTopPx = marginTopPx
+        dragOriginEndPx = marginEndPx
+    }
+
+    /**
+     * How far a header drag may travel, as `[minDx, maxDx, minDy, maxDy]` in dp.
+     *
+     * The page clamps its own visual position with these, so the panel stops at
+     * the container edge instead of sliding out from under the finger and being
+     * snapped back on release.
+     */
+    fun dragBoundsDp(): IntArray {
+        val view = currentView ?: return intArrayOf(0, 0, 0, 0)
+        val context = view.context
+        val containerWidth = currentContainer?.width ?: 0
+        val containerHeight = currentContainer?.height ?: 0
+        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+
+        val maxEnd = ((containerWidth - view.width).coerceAtLeast(0))
+        val maxTop = ((containerHeight - view.height).coerceAtLeast(0))
+
+        // Rightward: marginEnd may fall to 0, i.e. dx <= dragOriginEndPx.
+        // Leftward: marginEnd may grow to maxEnd, i.e. dx >= dragOriginEndPx - maxEnd.
+        val maxDx = (dragOriginEndPx / density).toInt()
+        val minDx = ((dragOriginEndPx - maxEnd) / density).toInt()
+        // Downward: marginTop may grow to maxTop.
+        val maxDy = ((maxTop - dragOriginTopPx) / density).toInt()
+        val minDy = (-dragOriginTopPx / density).toInt()
+        return intArrayOf(minDx, maxDx, minDy, maxDy)
+    }
+
+    /**
+     * Applies a header-drag delta in dp; returns the delta that was really applied.
+     *
+     * Runs the layout work on the main thread (a `layoutParams` write off the UI
+     * thread is undefined behaviour) but answers *immediately* with the clamped
+     * value, because the clamp is deterministic: the page's local transform only
+     * needs to know where the panel is going to be, not whether it has been laid
+     * out yet.
+     */
+    fun dragToDp(dxDp: Int, dyDp: Int): Pair<Int, Int> {
+        val view = currentView ?: return 0 to 0
+        val context = view.context
+        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+        val containerWidth = currentContainer?.width ?: 0
+        val containerHeight = currentContainer?.height ?: 0
+        val maxEnd = ((containerWidth - view.width).coerceAtLeast(0))
+        val maxTop = ((containerHeight - view.height).coerceAtLeast(0))
+
+        val targetEnd = (dragOriginEndPx - (dxDp * density).toInt()).let {
+            if (containerWidth > 0) it.coerceIn(0, maxEnd) else it.coerceAtLeast(0)
+        }
+        val targetTop = (dragOriginTopPx + (dyDp * density).toInt()).let {
+            if (containerHeight > 0) it.coerceIn(0, maxTop) else it.coerceAtLeast(0)
+        }
+
+        val appliedDx = ((dragOriginEndPx - targetEnd) / density).toInt()
+        val appliedDy = ((targetTop - dragOriginTopPx) / density).toInt()
+
+        // The *intent* is recorded synchronously so a release in the same frame can
+        // persist it; only the `LayoutParams` write is handed to the UI thread.
+        marginTopPx = targetTop
+        marginEndPx = targetEnd
+
+        view.post {
+            val live = currentView ?: return@post
+            val lp = live.layoutParams as? FrameLayout.LayoutParams ?: return@post
+            if (lp.topMargin == targetTop && lp.marginEnd == targetEnd) return@post
+            lp.topMargin = targetTop
+            lp.marginEnd = targetEnd
+            live.layoutParams = lp
+        }
+        return appliedDx to appliedDy
+    }
+
+    /** The current margin pair, in pixels, for persistence on drag release. */
+    fun marginsPx(): Pair<Int, Int> = marginTopPx to marginEndPx
+
+    /** Pulls the panel back inside the container after a restore or a rotation. */
+    private fun clampIntoContainer() {
+        val view = currentView ?: return
+        val lp = view.layoutParams as? FrameLayout.LayoutParams ?: return
+        if (view.width <= 0 || view.height <= 0) return
+        val containerWidth = currentContainer?.width ?: 0
+        val containerHeight = currentContainer?.height ?: 0
+        if (containerWidth <= 0 && containerHeight <= 0) return
+
+        val maxEnd = ((containerWidth - view.width).coerceAtLeast(0))
+        val maxTop = ((containerHeight - view.height).coerceAtLeast(0))
+        val clampedEnd = if (containerWidth > 0) marginEndPx.coerceIn(0, maxEnd) else marginEndPx
+        val clampedTop = if (containerHeight > 0) marginTopPx.coerceIn(0, maxTop) else marginTopPx
+        if (clampedEnd == marginEndPx && clampedTop == marginTopPx) return
+
+        marginEndPx = clampedEnd
+        marginTopPx = clampedTop
+        lp.topMargin = marginTopPx
+        lp.marginEnd = marginEndPx
+        view.layoutParams = lp
+        RegTrailLog.d("decor overlay margins clamped to top=$marginTopPx end=$marginEndPx")
     }
 
     val isAttached: Boolean get() = currentView != null

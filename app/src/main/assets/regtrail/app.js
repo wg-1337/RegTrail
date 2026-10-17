@@ -213,11 +213,12 @@
    * Applies the published panel list.
    *
    * ## The compatibility rule
-   * A `config.json` published by a build that predates the 内存/Agent tabs names
-   * only `status`/`log`/`tools`. Honouring it would hide the two tabs this build
-   * adds, and a missing tab reads as "the feature was never integrated" — the
-   * exact complaint this version answers. Such a list is therefore treated as
-   * "no opinion" until the settings app republishes.
+   * A `config.json` published by a build that predates the 内存/调试/Agent tabs names
+   * only the panels it knew about. Honouring that literally would hide the tabs this
+   * build adds, and a missing tab reads as "the feature was never integrated" — the
+   * exact complaint this version answers. Such a list is therefore only honoured for
+   * the panels it *does* name, and a tab this build added stays visible until the
+   * settings app republishes a list that mentions it.
    */
   function applyPanels(cfg) {
     var panels = [];
@@ -227,18 +228,32 @@
       }
     }
     if (!panels.length) return;
-    if (panels.indexOf('mem') < 0 && panels.indexOf('agent') < 0) return;
 
     var tabs = document.querySelectorAll('.tab');
     var firstVisible = '';
+    var anyKnown = false;
     for (var t = 0; t < tabs.length; t++) {
       var name = tabs[t].getAttribute('data-tab');
-      var visible = panels.indexOf(name) >= 0;
+      // A known publishing build names every tab it wants; one that predates a tab
+      // says nothing about it, which must not be read as "hide it".
+      var visible;
+      if (panels.indexOf(name) >= 0) {
+        visible = true;
+        anyKnown = true;
+      } else if (name === 'debug') {
+        visible = true;
+      } else if (panels.indexOf('mem') < 0 && panels.indexOf('agent') < 0) {
+        // A list from before 内存/Agent existed: no opinion about either.
+        visible = true;
+      } else {
+        visible = false;
+      }
       tabs[t].style.display = visible ? '' : 'none';
       if (visible && !firstVisible) firstVisible = name;
     }
+    if (!anyKnown) return;
     // The tab that was active may have just been hidden; leaving it active would
-    // make `currentTab()` lie and keep the log poller awake for nothing.
+    // make `currentTab()` lie and keep a poller awake for nothing.
     if (firstVisible && panels.indexOf(currentTab()) < 0) showTab(firstVisible);
   }
 
@@ -515,13 +530,16 @@
       views[j].classList.toggle('active', views[j].getAttribute('data-view') === name);
     }
     if (name === 'log') startLogPolling(); else stopLogPolling();
-    // Only 内存 and Agent have text fields; every other tab releases window focus
-    // so the soft keyboard cannot linger over a read-only page.
-    if (name !== 'mem' && name !== 'agent') setImeFocus(false);
+    // The 调试 tab polls call records; nothing else needs a timer.
+    if (name === 'debug') startDebugPolling(); else stopDebugPolling();
+    // Only 内存, 调试 and Agent have text fields; every other tab releases window
+    // focus so the soft keyboard cannot linger over a read-only page.
+    if (name !== 'mem' && name !== 'agent' && name !== 'debug') setImeFocus(false);
     // Cheap, non-blocking refreshes of the per-tab header lines. The heavy data
     // (a scan, a model turn) is always an explicit button press.
     if (name === 'mem') refreshMemoryState();
     if (name === 'agent') refreshAgentState();
+    if (name === 'debug') refreshDebugHooks();
   }
 
   function currentTab() {
@@ -933,6 +951,273 @@
     }
   }
 
+  /* ---- Header drag (moving the whole window) --------------------------- */
+
+  /*
+   * The expanded panel is moved by its **title bar**, never by its body: the body
+   * has to keep every touch for tabs, lists, text fields and the memory result
+   * rows. The collapsed pill keeps its own native drag handler; this one only ever
+   * runs while the panel is expanded.
+   *
+   * ## Why the maths is not "delta from pointerdown"
+   * The strategy is the resize grip's: draw locally first, tell native code at most
+   * once per animation frame, persist on release. One thing is different, though —
+   * for a *move* the WebView travels with the window, so every frame of native
+   * movement shifts `clientX` back the other way. A naive delta would therefore
+   * stall as soon as native code caught up (the panel stops tracking the finger).
+   *
+   * The panel's on-screen position is
+   *
+   *     native offset + local transform
+   *
+   * so the page asks native for the **total** delta `d` and draws `d - applied`
+   * locally, where `applied` is what the last `dragMove` reply said native code
+   * had really applied. `d` is the finger's travel in *screen* space:
+   *
+   *     d = (clientX - startClientX) + applied
+   *
+   * which is invariant to the window moving underneath. The panel therefore tracks
+   * the finger with no lag at all, the real window is at most one frame behind, and
+   * when native code clamps the window at the screen edge the page clamps `d` to
+   * the bounds `dragBegin` reported — so the panel stops at the wall instead of
+   * sliding away and snapping back on release.
+   */
+  var HEADER_SLOP_PX = 6;
+
+  function initHeaderDrag() {
+    var bar = byId('bar');
+    if (!bar) return;
+
+    var tracking = false;
+    var active = false;
+    var startX = 0;
+    var startY = 0;
+    var startScreenX = 0;
+    var startScreenY = 0;
+    var useScreen = false;
+    var latest = { x: 0, y: 0 };
+    var applied = { x: 0, y: 0 };
+    var bounds = null;
+    var frame = 0;
+    var clearTimer = 0;
+
+    function point(ev) {
+      var list = ev.changedTouches;
+      if ((!list || !list.length) && ev.touches && ev.touches.length) list = ev.touches;
+      if (list && list.length) return list[0];
+      if (typeof ev.clientX === 'number') return ev;
+      return null;
+    }
+
+    function transformTo(dx, dy) {
+      var panel = byId('panel');
+      if (!panel) return;
+      if (!dx && !dy) {
+        panel.style.transform = '';
+        return;
+      }
+      panel.style.transform =
+        'translate3d(' + Math.round(dx) + 'px,' + Math.round(dy) + 'px,0)';
+    }
+
+    function clampDelta(value, min, max) {
+      var v = Math.round(value);
+      if (typeof min === 'number' && v < min) return min;
+      if (typeof max === 'number' && v > max) return max;
+      return v;
+    }
+
+    /**
+     * Asks native code where the window may travel, once per gesture.
+     *
+     * Deferred until the finger has actually moved, so a plain tap on the title bar
+     * costs no bridge round trip. A refused reply (`collapsed`, `not attached`,
+     * preview mode) means "no drag", which is why the caller bails out on false.
+     */
+    function ensureBounds() {
+      if (bounds) return true;
+      var res = request('dragBegin');
+      if (!res || !res.ok) return false;
+      var data = res.data || {};
+      bounds = {
+        minDx: typeof data.minDx === 'number' ? data.minDx : null,
+        maxDx: typeof data.maxDx === 'number' ? data.maxDx : null,
+        minDy: typeof data.minDy === 'number' ? data.minDy : null,
+        maxDy: typeof data.maxDy === 'number' ? data.maxDy : null
+      };
+      return true;
+    }
+
+    function pushDrag(isFinal) {
+      var res = request('dragMove', { dx: latest.x, dy: latest.y, final: !!isFinal });
+      if (!res || !res.ok) return;
+      var data = res.data || {};
+      if (typeof data.dx !== 'number' || typeof data.dy !== 'number') return;
+      applied.x = data.dx;
+      applied.y = data.dy;
+      if (!isFinal) {
+        // Redraw the residue: what is still left for the local transform once
+        // native code has moved the window.
+        transformTo(latest.x - applied.x, latest.y - applied.y);
+      }
+    }
+
+    function begin(ev) {
+      if (collapsed || tracking) return;
+
+      // The title bar hosts the − and × buttons. A press that starts on one of
+      // them belongs to that button: dragging the window from there would eat the
+      // click, and the close button of a floating window is not a place to be
+      // clever about gesture disambiguation.
+      var target = ev.target;
+      if (target && target.closest) {
+        try {
+          if (target.closest('button')) return;
+        } catch (e) { /* ignore: a stripped WebView without closest() */ }
+      }
+
+      var p = point(ev);
+      if (!p) return;
+
+      tracking = true;
+      active = false;
+      startX = p.clientX;
+      startY = p.clientY;
+      // `screenX`/`screenY` are in *screen* pixels, so they do not move when the
+      // window moves underneath the finger. That is the ideal measurement for a
+      // window drag; the client-coordinate fallback has to be compensated with what
+      // native code reports, and that compensation can overshoot by a frame.
+      startScreenX = typeof p.screenX === 'number' ? p.screenX : p.clientX;
+      startScreenY = typeof p.screenY === 'number' ? p.screenY : p.clientY;
+      useScreen = typeof p.screenX === 'number' && typeof p.screenY === 'number';
+      latest = { x: 0, y: 0 };
+      applied = { x: 0, y: 0 };
+      bounds = null;
+
+      if (HAS_POINTER && bar.setPointerCapture && ev.pointerId !== undefined) {
+        // Without capture the move stream stops the moment the finger leaves the
+        // title bar, and a drag of a 300 dp panel leaves it immediately.
+        try { bar.setPointerCapture(ev.pointerId); } catch (e) { /* not fatal */ }
+      }
+      // No text selection and no long-press callout from a press on the title bar.
+      if (ev.cancelable) ev.preventDefault();
+    }
+
+    function move(ev) {
+      if (!tracking) return;
+
+      var p = point(ev);
+      if (!p) return;
+
+      if (!active) {
+        // A tap, or a wobble while pressing, is not a drag.
+        var slop = Math.abs(p.clientX - startX) + Math.abs(p.clientY - startY);
+        if (slop < HEADER_SLOP_PX) return;
+        if (!ensureBounds()) {
+          tracking = false;
+          return;
+        }
+        active = true;
+        document.body.classList.add('moving');
+      }
+
+      if (ev.cancelable) ev.preventDefault();
+
+      // Screen coordinates when the WebView reports them: the finger's travel is then
+      // measured independently of the window moving, so no compensation term is
+      // needed and the panel cannot drift.
+      var rawX;
+      var rawY;
+      if (useScreen) {
+        rawX = p.screenX - startScreenX;
+        rawY = p.screenY - startScreenY;
+        if (rawX === 0 && rawY === 0 &&
+            (Math.abs(p.clientX - startX) + Math.abs(p.clientY - startY)) >= HEADER_SLOP_PX) {
+          // screenX is present but constant on this WebView build: fall back for the
+          // rest of the gesture rather than freezing the panel.
+          useScreen = false;
+        }
+      }
+      if (!useScreen) {
+        rawX = applied.x + (p.clientX - startX);
+        rawY = applied.y + (p.clientY - startY);
+      }
+
+      var wantX = clampDelta(rawX, bounds.minDx, bounds.maxDx);
+      var wantY = clampDelta(rawY, bounds.minDy, bounds.maxDy);
+      latest.x = wantX;
+      latest.y = wantY;
+      transformTo(wantX - applied.x, wantY - applied.y);
+
+      // At most one native message per animation frame: a 120 Hz touch stream must
+      // not flood the synchronous JS bridge.
+      if (frame) return;
+      frame = raf(function () {
+        frame = 0;
+        if (!tracking || !active) return;
+        pushDrag(false);
+      });
+    }
+
+    function finish(ev) {
+      if (!tracking) return;
+      tracking = false;
+
+      var wasActive = active;
+      active = false;
+      document.body.classList.remove('moving');
+      if (frame && window.cancelAnimationFrame) window.cancelAnimationFrame(frame);
+      frame = 0;
+
+      if (!wasActive) {
+        bounds = null;
+        transformTo(0, 0);
+        return;
+      }
+
+      // The release event carries the finger's final position; without this the window
+      // would stop at the last *move* event and end a few pixels short of where the
+      // user let go.
+      var p = ev ? point(ev) : null;
+      if (p) {
+        var endX = useScreen ? (p.screenX - startScreenX) : (applied.x + (p.clientX - startX));
+        var endY = useScreen ? (p.screenY - startScreenY) : (applied.y + (p.clientY - startY));
+        if (typeof endX === 'number' && typeof endY === 'number') {
+          latest.x = clampDelta(endX, bounds.minDx, bounds.maxDx);
+          latest.y = clampDelta(endY, bounds.minDy, bounds.maxDy);
+        }
+      }
+
+      // `final: true` is what makes native code persist the position; per-frame
+      // messages only move the window.
+      pushDrag(true);
+      // Drop the local override once the native layout has certainly been applied.
+      // Clearing it in the same frame would snap the panel back for one frame; the
+      // delay is imperceptible and only matters when native code clamped the move.
+      if (clearTimer) clearTimeout(clearTimer);
+      clearTimer = setTimeout(function () {
+        clearTimer = 0;
+        bounds = null;
+        transformTo(0, 0);
+      }, 140);
+
+      if (HAS_POINTER && bar.releasePointerCapture && ev && ev.pointerId !== undefined) {
+        try { bar.releasePointerCapture(ev.pointerId); } catch (e) { /* not fatal */ }
+      }
+    }
+
+    bar.addEventListener(EV_DOWN, begin, false);
+    window.addEventListener(EV_MOVE, move, { passive: false });
+    window.addEventListener(EV_UP, finish, false);
+    window.addEventListener(EV_CANCEL, finish, false);
+    if (HAS_POINTER) {
+      // A pointer that leaves the window entirely never reports `pointerup` here;
+      // the lost-capture callback is what ends that drag.
+      bar.addEventListener('lostpointercapture', finish, false);
+      bar.addEventListener('pointerup', finish, false);
+    }
+  }
+
   function sendResize(widthDp, heightDp, isFinal) {
     var res = request('resize', {
       widthDp: widthDp,
@@ -1010,6 +1295,7 @@
     on('btn-mem-refine', function () { runMemoryScan(false); });
     on('btn-mem-revert-all', revertAllMemory);
     on('btn-mem-clear', clearMemorySession);
+    on('btn-mem-probe', runMemoryProbe);
 
     var value = byId('mem-value');
     if (value) {
@@ -1023,9 +1309,42 @@
     refreshMemoryState();
   }
 
+  /**
+   * 诊断: asks native code to explain, from inside the host process, whether memory
+   * access can work at all.
+   *
+   * The reply is plain text on purpose. When the answer is "this ROM's app domain is
+   * not allowed to open /proc/self/mem", nothing the panel can do makes a scan work,
+   * and the honest response is to show the evidence instead of a generic failure.
+   * The lines are also appended to the 日志 pane (and logged natively), because that
+   * is the copy the user can paste into a report.
+   */
+  function runMemoryProbe() {
+    setLine('mem-status', '正在诊断内存访问…');
+
+    var res = request('memProbe');
+    if (!res) { setLine('mem-status', '原生接口不可用（预览模式）', true); return; }
+    if (!res.ok) { setLine('mem-status', res.error || '诊断失败', true); return; }
+
+    var data = res.data || {};
+    var text = typeof data.text === 'string' ? data.text : '（空结果）';
+
+    var out = byId('mem-probe-out');
+    if (out) {
+      out.textContent = text;
+      out.style.display = 'block';
+    }
+
+    var lines = text.split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i]) appendLog(lines[i]);
+    }
+
+    setLine('mem-status', '诊断完成 · 结果见上方与「日志」页');
+  }
+
   /** Drops the search sessions; native keeps the recorded originals for 还原. */
-  function clearMemorySession() {
-    var res = request('memClear');
+  function clearMemorySession() {    var res = request('memClear');
     if (!res) { setLine('mem-status', '原生接口不可用（预览模式）', true); return; }
     if (!res.ok) { setLine('mem-status', res.error || '清空失败', true); return; }
 
@@ -1365,6 +1684,294 @@
     }
   }
 
+  /* ---- Debug tab (real-time method watching) --------------------------- */
+
+  /*
+   * A live view of one method's calls: arguments and return value, newest last.
+   *
+   * ## Why polling and not a push channel
+   * The bridge only goes one way (`Native.post` is page → native), so the page has to
+   * ask. It asks *incrementally*: every reply carries the last `seq` it saw, the next
+   * request sends it as `since`, and native code answers with only the newer entries.
+   * That keeps a 700 ms tick cheap even for a method called in a loop, and it means a
+   * dropped poll can never lose an entry or duplicate one.
+   *
+   * ## The two caps
+   * Native code keeps 200 entries per hook; this page renders at most 150 rows. Both
+   * caps exist for the same reason: watching a hot method must not grow the host
+   * app's heap or freeze a 300 dp panel.
+   */
+  var DEBUG_MAX_ROWS = 150;
+  var DEBUG_POLL_MS = 700;
+
+  /** Active hooks as native code reports them. */
+  var debugHooks = [];
+
+  /** Per-hook cursor: the last recorded sequence number this page has seen. */
+  var debugCursors = {};
+
+  var debugTimer = null;
+
+  function initDebug() {
+    on('btn-debug-search', runDebugSearch);
+    on('btn-debug-clear', clearDebugRecords);
+
+    var input = byId('debug-query');
+    if (input) {
+      bindTextFocus(input);
+      input.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') { ev.preventDefault(); runDebugSearch(); }
+      });
+    }
+    refreshDebugHooks();
+  }
+
+  function runDebugSearch() {
+    var input = byId('debug-query');
+    var query = input ? (input.value || '').trim() : '';
+    if (!query) {
+      setLine('debug-status', '请输入类名或方法名', true);
+      if (input) input.focus();
+      return;
+    }
+
+    setLine('debug-status', '正在搜索 ' + query + ' …');
+    var res = request('debugSearch', { query: query });
+    if (!res) { setLine('debug-status', '原生接口不可用（预览模式）', true); return; }
+    if (!res.ok) { setLine('debug-status', res.error || '搜索失败', true); return; }
+
+    var data = res.data || {};
+    renderDebugMethods(data);
+    setLine('debug-status', '找到 ' + (data.count || 0) + ' 个方法 · 扫描 ' +
+      (data.classesScanned || 0) + ' 个类 · ' + (data.elapsedMs || 0) + ' ms' +
+      (data.truncated ? '（结果已截断）' : ''));
+  }
+
+  function renderDebugMethods(data) {
+    var box = byId('debug-methods');
+    if (!box) return;
+    while (box.firstChild) box.removeChild(box.firstChild);
+
+    var methods = Object.prototype.toString.call(data.methods) === '[object Array]'
+      ? data.methods : [];
+    if (!methods.length) {
+      box.appendChild(el('p', 'hint',
+        '没有匹配的方法。搜索会先按类名匹配，再（在时间预算内）按方法名匹配；' +
+        '用「类名#方法名」可以精确定位。'));
+      return;
+    }
+    for (var i = 0; i < methods.length; i++) {
+      box.appendChild(debugMethodRow(methods[i]));
+    }
+  }
+
+  function debugMethodRow(method) {
+    var row = el('div', 'mem-row');
+    var params = Object.prototype.toString.call(method.params) === '[object Array]'
+      ? method.params : [];
+    var label = (method.className || '?') + '#' + (method.methodName || '?') +
+      '(' + params.join(', ') + ')';
+    row.appendChild(el('span', 'val', label));
+
+    var button = el('button', 'mini', '监听');
+    button.addEventListener('click', function () {
+      button.disabled = true;
+      installDebugHook(method, button);
+    });
+    row.appendChild(button);
+    return row;
+  }
+
+  function installDebugHook(method, button) {
+    setLine('debug-status', '正在监听 ' + (method.methodName || '?') + ' …');
+
+    var res = request('debugHook', {
+      className: method.className,
+      methodName: method.methodName,
+      params: method.params || [],
+      mode: 'trace'
+    });
+
+    if (button) button.disabled = false;
+    if (!res) { setLine('debug-status', '原生接口不可用（预览模式）', true); return; }
+    if (!res.ok) { setLine('debug-status', res.error || '监听失败', true); return; }
+
+    var data = res.data || {};
+    setLine('debug-status', '已监听 #' + data.hookId + ' · ' + (data.target || ''));
+    refreshDebugHooks();
+    startDebugPolling();
+  }
+
+  function refreshDebugHooks() {
+    var box = byId('debug-hooks');
+    var res = request('debugHooks');
+    if (!res) {
+      if (box) {
+        while (box.firstChild) box.removeChild(box.firstChild);
+      }
+      return;
+    }
+    if (!res.ok) return;
+
+    var data = res.data || {};
+    debugHooks = Object.prototype.toString.call(data.hooks) === '[object Array]'
+      ? data.hooks : [];
+    if (!box) return;
+
+    while (box.firstChild) box.removeChild(box.firstChild);
+    if (!debugHooks.length) return;
+
+    for (var i = 0; i < debugHooks.length; i++) {
+      box.appendChild(debugHookRow(debugHooks[i]));
+    }
+  }
+
+  function debugHookRow(hook) {
+    var row = el('div', 'hook-row');
+    var info = el('div', 'hook-info', hook.target || hook.label || hook.id || '?');
+    info.appendChild(el('span', 'count',
+      '#' + (hook.hookId || hook.id) + ' · 调用 ' + (hook.calls || 0) +
+      ' 次 · 已记录 ' + (hook.recorded || 0) + ' 条'));
+    row.appendChild(info);
+
+    var unhook = el('button', 'mini danger', '解除');
+    unhook.addEventListener('click', function () {
+      unhook.disabled = true;
+      removeDebugHook(hook.hookId || 0, unhook);
+    });
+    row.appendChild(unhook);
+    return row;
+  }
+
+  function removeDebugHook(hookId, button) {
+    if (!hookId) {
+      if (button) button.disabled = false;
+      setLine('debug-status', '这个 Hook 不是本页安装的，请在 Agent 控制台用 unhook 解除', true);
+      return;
+    }
+    var res = request('debugUnhook', { hookId: hookId });
+    if (button) button.disabled = false;
+    if (!res) { setLine('debug-status', '原生接口不可用（预览模式）', true); return; }
+    if (!res.ok) { setLine('debug-status', res.error || '解除失败', true); return; }
+
+    delete debugCursors[hookId];
+    setLine('debug-status', '已解除 Hook #' + hookId);
+    refreshDebugHooks();
+    if (!debugHooks.length) stopDebugPolling();
+  }
+
+  function startDebugPolling() {
+    if (debugTimer || collapsed) return;
+    pollDebugCalls();
+    debugTimer = setInterval(pollDebugCalls, DEBUG_POLL_MS);
+  }
+
+  function stopDebugPolling() {
+    if (!debugTimer) return;
+    clearInterval(debugTimer);
+    debugTimer = null;
+  }
+
+  function pollDebugCalls() {
+    if (collapsed || currentTab() !== 'debug') return;
+    if (!debugHooks.length) return;
+
+    for (var i = 0; i < debugHooks.length; i++) {
+      var hook = debugHooks[i];
+      if (!hook.hookId) continue;
+
+      var since = debugCursors[hook.hookId] || 0;
+      var res = request('debugCalls', { hookId: hook.hookId, since: since });
+      if (!res || !res.ok) continue;
+
+      var data = res.data || {};
+      if (typeof data.next === 'number') debugCursors[hook.hookId] = data.next;
+      if (typeof data.calls === 'number') hook.calls = data.calls;
+
+      var entries = Object.prototype.toString.call(data.entries) === '[object Array]'
+        ? data.entries : [];
+      for (var j = 0; j < entries.length; j++) {
+        appendDebugCall(hook, entries[j]);
+      }
+    }
+
+    // Call counts are the reason this is a live view; refresh them at the poll rate
+    // rather than only when a hook is installed.
+    refreshDebugHooks();
+  }
+
+  function shortTarget(target) {
+    var text = String(target || '?');
+    // `com.foo.Bar#baz(int)` → `Bar#baz(int)`: the package is the least useful part
+    // in a 300 dp panel, and the hash is what identifies the method.
+    var hash = text.indexOf('#');
+    if (hash < 0) return text;
+    var head = text.slice(0, hash);
+    var dot = head.lastIndexOf('.');
+    return (dot >= 0 ? head.slice(dot + 1) : head) + text.slice(hash);
+  }
+
+  function timeText(millis) {
+    if (typeof millis !== 'number' || millis <= 0) return '--:--:--';
+    var date = new Date(millis);
+    function pad(v, width) {
+      var s = String(v);
+      while (s.length < width) s = '0' + s;
+      return s;
+    }
+    return pad(date.getHours(), 2) + ':' + pad(date.getMinutes(), 2) + ':' +
+      pad(date.getSeconds(), 2) + '.' + pad(date.getMilliseconds(), 3);
+  }
+
+  function appendDebugCall(hook, entry) {
+    var box = byId('debug-calls');
+    if (!box || !entry) return;
+
+    var row = el('div', 'call');
+    var head = el('div', 'call-head');
+    head.appendChild(el('span', 'tag', shortTarget(hook.target || hook.label)));
+    head.appendChild(el('span', 'meta',
+      timeText(entry.at) + ' · ' + (entry.thread || '?') +
+      (typeof entry.ms === 'number' ? ' · ' + entry.ms + ' ms' : '')));
+    row.appendChild(head);
+
+    var args = Object.prototype.toString.call(entry.args) === '[object Array]'
+      ? entry.args : [];
+    row.appendChild(el('div', 'call-line', '参数: ' +
+      (args.length ? args.join(', ') : '（无）')));
+
+    if (entry.threw !== null && entry.threw !== undefined && entry.threw !== '') {
+      row.appendChild(el('div', 'call-line err', '抛出: ' + entry.threw));
+    } else {
+      var value = (entry.result === null || entry.result === undefined)
+        ? '（void）' : entry.result;
+      row.appendChild(el('div', 'call-line ret', '返回值: ' + value));
+    }
+
+    box.appendChild(row);
+    while (box.childNodes.length > DEBUG_MAX_ROWS) {
+      box.removeChild(box.firstChild);
+    }
+
+    var view = document.querySelector('.view[data-view="debug"]');
+    if (view) view.scrollTop = view.scrollHeight;
+  }
+
+  function clearDebugRecords() {
+    for (var i = 0; i < debugHooks.length; i++) {
+      var id = debugHooks[i].hookId;
+      if (!id) continue;
+      request('debugClear', { hookId: id });
+      debugCursors[id] = 0;
+    }
+    var box = byId('debug-calls');
+    if (box) {
+      while (box.firstChild) box.removeChild(box.firstChild);
+    }
+    setLine('debug-status', '已清空调用记录（Hook 仍然生效）');
+    refreshDebugHooks();
+  }
+
   /* ---- Agent tab ------------------------------------------------------ */
 
   /*
@@ -1599,7 +2206,9 @@
       initTabs();
       initButtons();
       initGrip();
+      initHeaderDrag();
       initMemory();
+      initDebug();
       initAgent();
       request('ready');
       refreshStatus();

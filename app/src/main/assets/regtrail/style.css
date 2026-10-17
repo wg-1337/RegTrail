@@ -54,6 +54,17 @@ html, body {
 }
 
 /* ---- Title bar (drag handle) ---------------------------------------- */
+/*
+ * The title bar is the one place that moves the *window*. The body must keep every
+ * touch for tabs, lists, text fields and the memory rows, which is why dragging is
+ * bound to `#bar` alone.
+ *
+ * `touch-action: none` is what makes that work: without it the WebView classifies
+ * the gesture as a page scroll after a few pixels, stops delivering the move
+ * stream, and the drag dies mid-way (the same failure the resize grip documents).
+ * Text selection and the long-press callout are suppressed for the same reason: a
+ * drag that highlights the panel's labels is not a drag handle, it is a fight.
+ */
 #bar {
   display: flex;
   align-items: center;
@@ -62,7 +73,15 @@ html, body {
   background: var(--bg-elev);
   border-bottom: 1px solid var(--line);
   flex: 0 0 auto;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  cursor: move;
 }
+
+/* The buttons inside the bar keep their own semantics (see `initHeaderDrag`). */
+#bar button { cursor: pointer; }
 
 #bar .dot {
   width: 8px;
@@ -202,6 +221,23 @@ body.dragging {
 }
 
 body.dragging .view { overflow: hidden; }
+
+/*
+ * While the window itself is being dragged by its title bar: no selection, no
+ * scroll, and no hover styling while the panel is translated. Kept separate from
+ * `body.dragging` so the resize grip's corner cursor does not leak into a move.
+ */
+body.moving {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: move;
+}
+
+body.moving .view { overflow: hidden; }
+
+/* The panel is translated by the page while native code catches up, so give the
+   compositor a hint once instead of every frame. */
+body.moving #panel { will-change: transform; }
 
 /*
  * Collapsed: the window is a pill and *must not* be resizable. Hiding the grip is
@@ -345,6 +381,78 @@ button.action:disabled {
 }
 
 .status-line.error { color: #ff7b72; }
+
+/* ---- Debug: live call records ---------------------------------------- */
+#debug-methods,
+#debug-hooks { margin-top: 2px; }
+
+/* One row per recorded invocation. Monospace because the interesting parts are
+   values, and a proportional font makes `int` and `long` values impossible to scan. */
+.call {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.call:last-child { border-bottom: none; }
+
+.call .call-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.call .call-head .tag {
+  flex: 0 0 auto;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10px * var(--regtrail-font-scale));
+  color: var(--regtrail-primary);
+}
+
+.call .call-head .meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: right;
+  color: var(--fg-dim);
+  font-size: calc(9.5px * var(--regtrail-font-scale));
+  word-break: break-all;
+}
+
+.call .call-line {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10.5px * var(--regtrail-font-scale));
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fg);
+}
+
+/* The return value is the thing the user is usually watching for, so it gets a
+   colour; an exception gets the same red the rest of the panel uses for errors. */
+.call .call-line.ret { color: #9ee493; }
+.call .call-line.err { color: #ff7b72; }
+
+/* One row per active hook: target, call count and the 「解除」 button. */
+.hook-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.hook-row .hook-info {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10px * var(--regtrail-font-scale));
+  word-break: break-all;
+}
+
+.hook-row .hook-info .count {
+  display: block;
+  color: var(--fg-dim);
+  font-size: calc(9.5px * var(--regtrail-font-scale));
+}
 
 /* ---- Scrollbar ------------------------------------------------------- */
 ::-webkit-scrollbar { width: 3px; }

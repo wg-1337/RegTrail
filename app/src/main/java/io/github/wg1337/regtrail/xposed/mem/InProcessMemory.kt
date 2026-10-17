@@ -2,7 +2,6 @@ package io.github.wg1337.regtrail.xposed.mem
 
 import io.github.wg1337.regtrail.xposed.RegTrailLog
 import java.io.File
-import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
@@ -64,6 +63,17 @@ internal object InProcessMemory {
      * the WebView's bridge thread for the whole read.
      */
     const val MAX_TOTAL_BYTES = 64L * 1024 * 1024
+
+    /**
+     * Total bytes one scan may read when the transport is the reflection-based
+     * `sun.misc.Unsafe` one.
+     *
+     * That path is one JNI call per 8 bytes instead of one `pread` per page, so 64
+     * MiB would take seconds and read as a hang. 16 MiB still covers the app's
+     * Dalvik heap sections where a counter or a flag lives, and the reply says the
+     * budget was reduced so the number is never a mystery.
+     */
+    const val MAX_TOTAL_BYTES_UNSAFE_ELEMENTWISE = 16L * 1024 * 1024
 
     /** Cap on regions visited per scan, so a pathological maps file cannot spin. */
     const val MAX_REGIONS = 2000
@@ -199,6 +209,14 @@ internal object InProcessMemory {
         val regionsSkipped: Int,
         val totalRegions: Int,
         val note: String,
+        /** Wall-clock duration of the pass, in milliseconds. */
+        val elapsedMs: Long = 0L,
+        /** Which transport actually produced the bytes (`proc-mem` / `unsafe`). */
+        val transport: String = "",
+        /** Regions the filter kept, out of [totalRegions]. */
+        val regionsKept: Int = 0,
+        /** Pages that could not be read (unmapped holes inside a live region). */
+        val pageFailures: Int = 0,
     )
 
     /** The outcome of one write, including what was there before. */
@@ -337,6 +355,7 @@ internal object InProcessMemory {
         maxResults: Int = DEFAULT_MAX_RESULTS,
         shouldStop: () -> Boolean = { false },
     ): Scan {
+        val startedAt = System.nanoTime()
         val needle = kind.encode(rawValue)
             ?: throw MemException("无法把「$rawValue」解析为 ${kind.wire}")
 
@@ -357,16 +376,20 @@ internal object InProcessMemory {
         val found = ArrayList<Match>(minOf(limit, 64))
         var bytesRead = 0L
         var regionsRead = 0
+        var pageFailures = 0
         var truncated = ordered.size < candidates.size
         var stopped = false
 
-        RandomAccessFile("/proc/self/mem", "r").use { mem ->
+        val transport = openTransport()
+        // The budget depends on the transport: the reflection-based one is far slower.
+        val budget = transport.maxTotalBytes.coerceAtMost(MAX_TOTAL_BYTES)
+        try {
             for (region in ordered) {
                 if (shouldStop()) {
                     stopped = true
                     break
                 }
-                val left = MAX_TOTAL_BYTES - bytesRead
+                val left = budget - bytesRead
                 if (left < PAGE_BYTES) {
                     truncated = true
                     break
@@ -374,23 +397,41 @@ internal object InProcessMemory {
                 val want = minOf(region.size, MAX_REGION_BYTES, left)
                 if (want < region.size) truncated = true
 
-                val data = readRegion(mem, region.start, want) ?: continue
-                regionsRead++
-                bytesRead += data.size
+                val chunk = readRegion(transport, region.start, want) ?: continue
+                pageFailures += chunk.failedPages
+                if (chunk.data.isEmpty()) continue
 
-                if (scanBuffer(data, region.start, kind, needle, limit, found)) {
+                regionsRead++
+                bytesRead += chunk.data.size
+
+                if (
+                    scanBuffer(
+                        data = chunk.data,
+                        baseAddress = region.start,
+                        kind = kind,
+                        needle = needle,
+                        limit = limit,
+                        out = found,
+                        validPages = chunk.validPages,
+                    )
+                ) {
                     truncated = true
                     break
                 }
             }
+        } finally {
+            transport.close()
         }
 
         if (regionsRead == 0) {
             throw MemException(
-                "无法从 /proc/self/mem 读取任何数据（尝试了 ${ordered.size} 个区域）",
+                "无法从 ${transport.name} 读取任何数据（尝试了 ${ordered.size} 个区域，" +
+                    "失败页 $pageFailures）",
             )
         }
         if (stopped) throw MemException("扫描已取消")
+
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
 
         // Address-ascending output: deterministic across runs, which is what makes
         // "the third address is the one I want" reproducible.
@@ -401,17 +442,36 @@ internal object InProcessMemory {
             append(regionsRead).append(" 个区域")
             if (truncated) {
                 append("；已达到预算上限（单次最多 ")
-                append(mib(MAX_TOTAL_BYTES))
+                append(mib(budget))
                 append("），未扫完的地址空间需要靠「再次扫描」缩小范围")
             }
+            if (pageFailures > 0) {
+                append("；").append(pageFailures).append(" 个页面不可读（区域内的空洞，已跳过）")
+            }
+            append("；传输=").append(transport.name)
+            append("；耗时=").append(elapsedMs).append(" ms")
             if (!writableOnly) append("；含只读代码段")
         }
 
         RegTrailLog.d(
             "mem: scan ${kind.wire} → ${matches.size} 命中 " +
-                "(${regionsRead} 区域, ${mib(bytesRead)}, truncated=$truncated)",
+                "($regionsRead 区域, ${mib(bytesRead)}, ${elapsedMs}ms, " +
+                "transport=${transport.name}, truncated=$truncated, " +
+                "pageFailures=$pageFailures, kept=${candidates.size}/${all.size})",
         )
-        return Scan(matches, truncated, bytesRead, regionsRead, all.size - candidates.size, all.size, note)
+        return Scan(
+            matches = matches,
+            truncated = truncated,
+            bytesRead = bytesRead,
+            regionsRead = regionsRead,
+            regionsSkipped = all.size - candidates.size,
+            totalRegions = all.size,
+            note = note,
+            elapsedMs = elapsedMs,
+            transport = transport.name,
+            regionsKept = candidates.size,
+            pageFailures = pageFailures,
+        )
     }
 
     /**
@@ -431,6 +491,7 @@ internal object InProcessMemory {
         maxResults: Int = DEFAULT_MAX_RESULTS,
         shouldStop: () -> Boolean = { false },
     ): Scan {
+        val startedAt = System.nanoTime()
         val needle = kind.encode(rawValue)
             ?: throw MemException("无法把「$rawValue」解析为 ${kind.wire}")
         if (previous.isEmpty()) {
@@ -443,40 +504,44 @@ internal object InProcessMemory {
         var unreadable = 0
         val buffer = ByteArray(needle.size)
 
-        RandomAccessFile("/proc/self/mem", "r").use { mem ->
+        val transport = openTransport()
+        try {
             for (candidate in previous) {
                 if (shouldStop()) throw MemException("扫描已取消")
                 if (kept.size >= limit) break
                 checked++
 
-                val bytes = runCatching {
-                    mem.seek(candidate.address)
-                    mem.readFully(buffer)
-                    buffer.copyOf()
-                }.getOrNull()
-                if (bytes == null) {
+                if (!transport.readInto(candidate.address, buffer, 0, needle.size)) {
                     // The page was freed or remapped since the first pass. That is
                     // normal in a running app, not an error.
                     unreadable++
                     continue
                 }
-                if (!bytes.contentEquals(needle)) continue
+                if (!buffer.contentEquals(needle)) continue
 
                 kept += candidate.copy(
-                    value = kind.decode(bytes),
-                    preview = hex(bytes, CONTEXT_BYTES),
+                    value = kind.decode(buffer.copyOf()),
+                    preview = hex(buffer, CONTEXT_BYTES),
                 )
             }
+        } finally {
+            transport.close()
         }
 
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
         val note = buildString {
             append("复核 ").append(checked).append(" 个地址，保留 ")
             append(kept.size).append(" 个")
             if (unreadable > 0) append("；").append(unreadable).append(" 个地址已不可读（内存已释放）")
             if (checked < previous.size) append("；达到结果上限，未复核全部地址")
+            append("；传输=").append(transport.name)
+            append("；耗时=").append(elapsedMs).append(" ms")
         }
 
-        RegTrailLog.d("mem: refine ${kind.wire} → ${kept.size} 命中 (checked=$checked)")
+        RegTrailLog.d(
+            "mem: refine ${kind.wire} → ${kept.size} 命中 " +
+                "(checked=$checked, ${elapsedMs}ms, transport=${transport.name})",
+        )
         return Scan(
             matches = kept.sortedBy { it.address },
             truncated = checked < previous.size,
@@ -485,6 +550,10 @@ internal object InProcessMemory {
             regionsSkipped = unreadable,
             totalRegions = previous.size,
             note = note,
+            elapsedMs = elapsedMs,
+            transport = transport.name,
+            regionsKept = kept.size,
+            pageFailures = unreadable,
         )
     }
 
@@ -506,6 +575,7 @@ internal object InProcessMemory {
         needle: ByteArray,
         limit: Int,
         out: MutableList<Match>,
+        validPages: BooleanArray? = null,
     ): Boolean {
         val size = needle.size
         if (size == 0 || data.size < size) return false
@@ -525,6 +595,13 @@ internal object InProcessMemory {
                     hit = false
                     break
                 }
+            }
+            // A page that could not be read stays zero-filled, and a `0` needle
+            // would otherwise "match" every byte of it. A hit therefore has to sit
+            // entirely inside pages that were really read.
+            if (hit && validPages != null) {
+                if (!validPages[offset / PAGE_BYTES]) hit = false
+                else if (!validPages[(offset + size - 1) / PAGE_BYTES]) hit = false
             }
             if (hit) {
                 val contextLength = minOf(preview.size, data.size - offset)
@@ -555,14 +632,12 @@ internal object InProcessMemory {
     fun read(address: Long, length: Int): ByteArray? {
         if (address <= 0L) return null
         val size = length.coerceIn(1, MAX_WRITE_BYTES)
-        return runCatching {
-            RandomAccessFile("/proc/self/mem", "r").use { mem ->
-                mem.seek(address)
-                val buffer = ByteArray(size)
-                mem.readFully(buffer)
-                buffer
-            }
-        }.getOrNull()
+        val transport = openTransport()
+        return try {
+            transport.read(address, size)
+        } finally {
+            transport.close()
+        }
     }
 
     /**
@@ -612,15 +687,15 @@ internal object InProcessMemory {
         val before = read(address, bytes.size)
             ?: throw MemException("无法读取地址 ${hexAddress(address)} 的原始内容")
 
-        runCatching {
-            RandomAccessFile("/proc/self/mem", "rw").use { mem ->
-                mem.seek(address)
-                mem.write(bytes)
+        val transport = openWriteTransport()
+        try {
+            if (!transport.write(address, bytes)) {
+                throw MemException(
+                    "写入 ${hexAddress(address)} 失败：${transport.name} 拒绝了这次写",
+                )
             }
-        }.getOrElse { t ->
-            throw MemException(
-                "写入 ${hexAddress(address)} 失败：${t.message ?: t::class.java.simpleName}",
-            )
+        } finally {
+            transport.close()
         }
 
         val after = read(address, bytes.size)
@@ -629,7 +704,10 @@ internal object InProcessMemory {
         // Remember the pristine bytes only once per address.
         originals.putIfAbsent(address, before)
 
-        RegTrailLog.i("mem: write ${hexAddress(address)} (${bytes.size} B) verified=$verified")
+        RegTrailLog.i(
+            "mem: write ${hexAddress(address)} (${bytes.size} B) verified=$verified " +
+                "transport=${transport.name}",
+        )
         return WriteOutcome(
             address = address,
             written = bytes,
@@ -648,15 +726,13 @@ internal object InProcessMemory {
             throw MemException("地址所在区域已变为不可写（${region.perms}），无法还原")
         }
 
-        runCatching {
-            RandomAccessFile("/proc/self/mem", "rw").use { mem ->
-                mem.seek(address)
-                mem.write(original)
+        val transport = openWriteTransport()
+        try {
+            if (!transport.write(address, original)) {
+                throw MemException("还原 ${hexAddress(address)} 失败：${transport.name} 拒绝了这次写")
             }
-        }.getOrElse { t ->
-            throw MemException(
-                "还原 ${hexAddress(address)} 失败：${t.message ?: t::class.java.simpleName}",
-            )
+        } finally {
+            transport.close()
         }
 
         val after = read(address, original.size)
@@ -711,32 +787,256 @@ internal object InProcessMemory {
     // -----------------------------------------------------------------------
 
     /**
-     * Reads [want] bytes at [start], tolerating unmapped holes.
+     * Reads [want] bytes at [start], one 4 KiB page at a time.
      *
-     * `readFully` would give up at the first `EIO`. Reading page by page keeps the
-     * bytes before the hole, which matters: a region from `/proc/self/maps` can
-     * still contain a page that was unmapped between the maps read and this read.
+     * `readFully` over a whole region would give up at the first `EIO`, and a
+     * mapping listed in `/proc/self/maps` really can contain a hole: the page can
+     * be unmapped between the maps read and this read, and Android's Dalvik
+     * mappings have guard pages inside them. Each page is therefore read
+     * individually and a failure only costs that page — [ReadChunk.validPages] is
+     * what keeps the zero-filled hole from producing false matches.
      */
-    private fun readRegion(mem: RandomAccessFile, start: Long, want: Long): ByteArray? {
+    private fun readRegion(transport: MemTransport, start: Long, want: Long): ReadChunk? {
         if (want <= 0L) return null
         val size = want.toInt()
+        val pageCount = (size + PAGE_BYTES - 1) / PAGE_BYTES
         val buffer = ByteArray(size)
-        var filled = 0
-        while (filled < size) {
-            val chunk = minOf(PAGE_BYTES, size - filled)
-            val read = runCatching {
-                mem.seek(start + filled)
-                mem.read(buffer, filled, chunk)
-            }.getOrDefault(-1)
-            if (read <= 0) break
-            filled += read
+        val valid = BooleanArray(pageCount)
+        var failed = 0
+        var lastGood = -1
+        var offset = 0
+        var page = 0
+        while (page < pageCount) {
+            val length = minOf(PAGE_BYTES, size - offset)
+            val ok = runCatching {
+                transport.readInto(start + offset, buffer, offset, length)
+            }.getOrDefault(false)
+            if (ok) {
+                valid[page] = true
+                lastGood = page
+            } else {
+                failed++
+            }
+            offset += length
+            page++
         }
-        return when {
-            filled == 0 -> null
-            filled == size -> buffer
-            else -> buffer.copyOf(filled)
+        if (lastGood < 0) return null
+
+        // Drop the trailing run of unreadable pages: scanning zeros there would only
+        // waste comparisons (and the validity map already blocks false hits).
+        val endByte = minOf(size, (lastGood + 1) * PAGE_BYTES)
+        return if (endByte == size) {
+            ReadChunk(buffer, valid, failed)
+        } else {
+            ReadChunk(buffer.copyOf(endByte), valid.copyOf(lastGood + 1), failed)
         }
     }
+
+    /** Bytes of one region, with the page-validity map [readRegion] built. */
+    private class ReadChunk(
+        val data: ByteArray,
+        val validPages: BooleanArray,
+        val failedPages: Int,
+    )
+
+    // -----------------------------------------------------------------------
+    // Transport selection
+    // -----------------------------------------------------------------------
+
+    /**
+     * Why `/proc/self/mem` could not be opened, once that is known.
+     *
+     * Cached so a scan does not pay for a failing `open()` on every call, and so the
+     * log says it once instead of on every scan. A ROM does not gain the file back
+     * while the process runs.
+     */
+    @Volatile
+    private var procMemReadFailure: String? = null
+
+    /** The read transport: `/proc/self/mem` when it opens, otherwise `Unsafe`. */
+    private fun openTransport(): MemTransport {
+        val known = procMemReadFailure
+        if (known == null) {
+            val reason = StringBuilder()
+            ProcMemTransport.open(reason)?.let { return it }
+            procMemReadFailure = reason.toString()
+            RegTrailLog.w(
+                "mem: /proc/self/mem 不可读（$reason），改用 sun.misc.Unsafe 传输",
+            )
+        }
+        return UnsafeTransport.get() ?: throw MemException(
+            "/proc/self/mem 无法打开（$known），且 sun.misc.Unsafe 不可用：" +
+                (UnsafeTransport.unavailableReason() ?: "未知原因"),
+        )
+    }
+
+    /** The write transport: `/proc/self/mem` opened `rw`, otherwise `Unsafe`. */
+    private fun openWriteTransport(): MemTransport {
+        val reason = StringBuilder()
+        ProcMemTransport.openWrite(reason)?.let { return it }
+        return UnsafeTransport.get() ?: throw MemException(
+            "无法写入：/proc/self/mem 无法以读写方式打开（$reason），" +
+                "且 sun.misc.Unsafe 不可用：" +
+                (UnsafeTransport.unavailableReason() ?: "未知原因"),
+        )
+    }
+
+    /**
+     * A plain-text report of everything that decides whether the 内存 tab can work.
+     *
+     * This exists because "内存搜索不可用" is not a bug report: the answer lives in
+     * four independent facts (does `maps` parse, does the filter keep anything, does
+     * `/proc/self/mem` open for read and for write, and which transport survives),
+     * and none of them are visible from the settings app. The 内存 tab's 「诊断」
+     * button prints exactly this, and it is logged line by line so it survives in
+     * the 日志 tab and in the framework log.
+     */
+    fun probeReport(): String {
+        val out = StringBuilder()
+        fun line(text: String) {
+            out.append(text).append('\n')
+        }
+
+        line("=== RegTrail 内存诊断 ===")
+        line("进程: ${processName()} pid=${android.os.Process.myPid()} " +
+            "uid=${android.os.Process.myUid()}")
+        line("SELinux: ${selinuxContext()}")
+        line("Android: ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) " +
+            "ABI=${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"}")
+
+        // 1) maps
+        var all: List<Region> = emptyList()
+        val mapsResult = runCatching { regions() }
+        mapsResult.fold(
+            onSuccess = { all = it },
+            onFailure = { line("/proc/self/maps: 读取失败 — ${it.message}") },
+        )
+        if (all.isNotEmpty()) {
+            val readable = all.count { it.readable }
+            val writable = all.count { it.writable }
+            line("/proc/self/maps: ${all.size} 个映射（可读 $readable / 可写 $writable）")
+        }
+
+        // 2) filter
+        val keptAll = all.filter { it.isScannable(false) }
+        val keptWritable = all.filter { it.isScannable(true) }
+        line(
+            "区域过滤: 全部 ${all.size} → 保留 ${keptAll.size}（不限可写）/ " +
+                "${keptWritable.size}（只搜可写）",
+        )
+        val dropped = all.filter { !it.isScannable(false) }
+        if (dropped.isNotEmpty()) {
+            line("丢弃示例（共 ${dropped.size}）：")
+            dropped.take(4).forEach { line("  - ${describeRegionDropped(it)}") }
+        }
+        if (keptAll.isNotEmpty()) {
+            line("保留示例（共 ${keptAll.size}）：")
+            keptAll.take(4).forEach {
+                line("  - ${hexAddress(it.start)}-${hexAddress(it.end)} ${it.perms} ${it.label}")
+            }
+        }
+
+        // 3) /proc/self/mem
+        val readReason = StringBuilder()
+        val readHandle = ProcMemTransport.open(readReason)
+        line(
+            "/proc/self/mem 打开(读): " +
+                if (readHandle != null) "成功" else "失败 — $readReason",
+        )
+        val writeReason = StringBuilder()
+        val writeHandle = ProcMemTransport.openWrite(writeReason)
+        line(
+            "/proc/self/mem 打开(读写): " +
+                if (writeHandle != null) "成功" else "失败 — $writeReason",
+        )
+
+        // 4) one sample page read through every available transport
+        val sample = keptAll.minByOrNull { it.size } ?: all.firstOrNull()
+        val sampleLength = sample?.let { minOf(PAGE_BYTES.toLong(), it.size).toInt() } ?: PAGE_BYTES
+        if (sample != null) {
+            line(
+                "样例区域: ${hexAddress(sample.start)}-${hexAddress(sample.end)} " +
+                    "${sample.perms} ${sample.label}",
+            )
+            val procResult = readHandle?.read(sample.start, sampleLength)
+            line(
+                "  样例读取(proc-mem): " +
+                    if (procResult != null) "成功 ${hex(procResult, 16)}" else "失败",
+            )
+            val unsafe = UnsafeTransport.get()
+            if (unsafe == null) {
+                line("  样例读取(unsafe): 不可用 — ${UnsafeTransport.unavailableReason() ?: "?"}")
+            } else {
+                val unsafeResult = runCatching { unsafe.read(sample.start, sampleLength) }.getOrNull()
+                line(
+                    "  样例读取(unsafe): " +
+                        if (unsafeResult != null) {
+                            "成功 ${hex(unsafeResult, 16)}"
+                        } else {
+                            "失败（所有读取方法都无法访问该页）"
+                        },
+                )
+                line("  unsafe 实现: ${unsafe.describe()}")
+            }
+        } else {
+            line("样例区域: 没有可用的映射")
+        }
+
+        // 5) the decision
+        val chosen = when {
+            readHandle != null && UnsafeTransport.get() != null -> "proc-mem（unsafe 也可用）"
+            readHandle != null -> "proc-mem"
+            UnsafeTransport.get() != null -> "unsafe（/proc/self/mem 被拒绝，已自动降级）"
+            else -> "无可用传输：内存搜索与写入都不可用"
+        }
+        line("传输: $chosen")
+        if (readHandle == null) {
+            line(
+                "说明: 本 ROM 的应用域不允许打开 /proc/self/mem（open 即返回 EACCES），" +
+                    "这是系统限制，不是模块权限问题。Unsafe 传输直接读写本进程地址空间，" +
+                    "不需要打开任何文件；扫描按 4 KiB 页读取，且只读 /proc/self/maps 报告的区间。",
+            )
+        }
+        line("=== 诊断结束 ===")
+
+        runCatching { readHandle?.close() }
+        runCatching { writeHandle?.close() }
+        return out.toString()
+    }
+
+    /** `/proc/self/maps` label plus why the filter rejected it. */
+    private fun describeRegionDropped(region: Region): String {
+        val label = region.label
+        val lower = label.lowercase()
+        val why = when {
+            !region.readable -> "不可读（${region.perms}）"
+            lower.endsWith(".so") -> "共享库"
+            lower.startsWith("/memfd:") -> "memfd（JIT 缓存）"
+            lower.startsWith("/data/dalvik-cache/") -> "dalvik-cache"
+            lower.startsWith("/system/") || lower.startsWith("/apex/") ||
+                lower.startsWith("/vendor/") || lower.startsWith("/product/") ||
+                lower.startsWith("/system_ext/") || lower.startsWith("/odm/") -> "系统镜像"
+            lower.startsWith("/dev/") -> "设备映射"
+            lower.startsWith("[vvar") || lower.startsWith("[vdso") ||
+                lower.startsWith("[vsyscall") || lower.startsWith("[vectors") -> "内核特殊段"
+            else -> "其他"
+        }
+        return "${hexAddress(region.start)}-${hexAddress(region.end)} " +
+            "${region.perms} $label — $why"
+    }
+
+    /** `/proc/self/cmdline` first token; the process name as the kernel sees it. */
+    private fun processName(): String = runCatching {
+        File("/proc/self/cmdline").readBytes()
+            .takeWhile { it != 0.toByte() }
+            .toByteArray()
+            .toString(Charsets.UTF_8)
+    }.getOrNull()?.takeIf { it.isNotBlank() } ?: "?"
+
+    /** The SELinux domain this process runs in; useful to compare across ROMs. */
+    private fun selinuxContext(): String = runCatching {
+        File("/proc/self/attr/current").readText().trim().trimEnd('\u0000')
+    }.getOrNull()?.takeIf { it.isNotBlank() } ?: "不可读"
 
     /** `0x7f12345000`. */
     fun hexAddress(address: Long): String = "0x" + java.lang.Long.toHexString(address)

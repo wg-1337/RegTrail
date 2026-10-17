@@ -73,6 +73,23 @@ internal object DebugHookBehavior {
     )
 
     /**
+     * Keep every call's arguments and return value for the 调试 tab.
+     *
+     * This is the behaviour the overlay's 「监听」 button installs. It records *and*
+     * traces: the ring is what the page renders live, and the log line is what
+     * survives in the 日志 tab when the page is gone.
+     *
+     * @param every record/log every Nth call; 1 for "every call".
+     */
+    fun record(id: String = "", every: Long = 1L): HookBehavior = HookBehavior(
+        id = id,
+        trace = true,
+        traceEvery = every.coerceAtLeast(1L),
+        record = true,
+        recordEvery = every.coerceAtLeast(1L),
+    )
+
+    /**
      * Force the method to return [value].
      *
      * The original still runs, so side effects are preserved: this is the

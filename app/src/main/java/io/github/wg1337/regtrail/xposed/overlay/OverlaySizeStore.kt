@@ -113,6 +113,54 @@ internal class OverlaySizeStore(context: Context) {
         }
     }
 
+    /**
+     * The remembered window position, in pixels, or null when never dragged.
+     *
+     * Only the `TYPE_APPLICATION_OVERLAY` mechanism uses this: there the window
+     * has a real screen position. The remembered value is *not* trusted to still
+     * be on screen — the controller clamps it against the current display when it
+     * applies it (see `OverlayController.snapIntoBounds`), because a position saved
+     * in landscape can be far off-screen after a rotation.
+     */
+    fun position(): Pair<Int, Int>? = runCatching {
+        val x = prefs.getInt(KEY_X, ABSENT)
+        val y = prefs.getInt(KEY_Y, ABSENT)
+        if (x == ABSENT || y == ABSENT) null else x to y
+    }.getOrNull()
+
+    /** Records a dragged window position, in pixels. */
+    fun rememberPosition(xPx: Int, yPx: Int) {
+        runCatching {
+            prefs.edit().putInt(KEY_X, xPx).putInt(KEY_Y, yPx).apply()
+        }.onFailure {
+            RegTrailLog.w("overlay: cannot persist panel position", it)
+        }
+    }
+
+    /**
+     * The remembered panel position **inside the Activity content area**, in
+     * pixels, for the DecorView mechanism (`topMargin`, `marginEnd`).
+     *
+     * Kept separately from [position] because the two mechanisms measure position
+     * in different spaces: one against the screen, one against the host Activity's
+     * content view. Sharing one pair would make switching mechanisms teleport the
+     * panel.
+     */
+    fun margins(): Pair<Int, Int>? = runCatching {
+        val top = prefs.getInt(KEY_MARGIN_TOP, ABSENT)
+        val end = prefs.getInt(KEY_MARGIN_END, ABSENT)
+        if (top == ABSENT || end == ABSENT) null else top to end
+    }.getOrNull()
+
+    /** Records a dragged DecorView margin pair, in pixels. */
+    fun rememberMargins(topPx: Int, endPx: Int) {
+        runCatching {
+            prefs.edit().putInt(KEY_MARGIN_TOP, topPx).putInt(KEY_MARGIN_END, endPx).apply()
+        }.onFailure {
+            RegTrailLog.w("overlay: cannot persist panel margins", it)
+        }
+    }
+
     /** Drops the remembered size, falling back to the published default. */
     private fun clear() {
         runCatching {
@@ -142,6 +190,14 @@ internal class OverlaySizeStore(context: Context) {
         const val KEY_HEIGHT = "panel_height_dp"
         const val KEY_BASE_WIDTH = "panel_base_width_dp"
         const val KEY_BASE_HEIGHT = "panel_base_height_dp"
+
+        /** Window position, in screen pixels (application-overlay mechanism). */
+        const val KEY_X = "panel_x_px"
+        const val KEY_Y = "panel_y_px"
+
+        /** Panel position inside the Activity content area, in pixels. */
+        const val KEY_MARGIN_TOP = "panel_margin_top_px"
+        const val KEY_MARGIN_END = "panel_margin_end_px"
 
         /** Sentinel for "no such key"; any non-positive width means the same. */
         const val ABSENT = -1

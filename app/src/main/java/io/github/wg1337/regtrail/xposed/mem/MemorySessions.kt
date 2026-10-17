@@ -213,9 +213,29 @@ internal object MemorySessions {
         }
     }
 
+    /**
+     * Runs the in-process diagnostics and returns them as text.
+     *
+     * Every line is also logged at info level, so pressing 「诊断」 in the 内存 tab
+     * leaves the report in the 日志 tab and in the framework log even after the page
+     * has been reloaded — a screenshot of a floating window is not a bug report, but
+     * a log line is.
+     */
+    fun probe(): JsonObject {
+        val text = InProcessMemory.probeReport()
+        text.lineSequence().forEach { line ->
+            if (line.isNotBlank()) RegTrailLog.i("memProbe: $line")
+        }
+        return buildJsonObject {
+            put("text", JsonPrimitive(text))
+            put("lines", JsonPrimitive(text.lineSequence().count { it.isNotBlank() }))
+            put("session", JsonPrimitive(current() ?: 0))
+            put("modifiedCount", JsonPrimitive(InProcessMemory.modifiedCount))
+        }
+    }
+
     /** Session list plus every address this process has modified. */
-    fun describe(): JsonObject {
-        val snapshot = synchronized(lock) { sessions.values.toList() }
+    fun describe(): JsonObject {        val snapshot = synchronized(lock) { sessions.values.toList() }
         return buildJsonObject {
             put("count", JsonPrimitive(snapshot.size))
             put("current", JsonPrimitive(current() ?: 0))
@@ -302,6 +322,14 @@ internal object MemorySessions {
         put("bytesRead", JsonPrimitive(scan.bytesRead))
         put("regionsRead", JsonPrimitive(scan.regionsRead))
         put("regionsTotal", JsonPrimitive(scan.totalRegions))
+        // The scan's own accounting: which transport produced the bytes, how long it
+        // took and how many regions the filter kept/dropped. Without these a
+        // "no results" reply cannot be told apart from "nothing was read".
+        put("regionsKept", JsonPrimitive(scan.regionsKept))
+        put("regionsDropped", JsonPrimitive(scan.totalRegions - scan.regionsKept))
+        put("pageFailures", JsonPrimitive(scan.pageFailures))
+        put("elapsedMs", JsonPrimitive(scan.elapsedMs))
+        put("transport", JsonPrimitive(scan.transport))
         put("modifiedCount", JsonPrimitive(InProcessMemory.modifiedCount))
         put("results", buildJsonArray {
             scan.matches.forEach { match ->

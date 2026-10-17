@@ -24,3 +24,6 @@ Thumbs.db
 _research/src/
 _research/*.tar.gz*
 _research/*.jar
+
+# On-device debugging scratch (adb screenshots, pulled module logs)
+.devlogs/

@@ -160,6 +160,136 @@ internal object DebugEngine {
         return out
     }
 
+    /**
+     * Methods a 调试 tab query matches, best-first and bounded in time.
+     *
+     * ## What the query may be
+     *  - `Login` — a class-name fragment. Every class whose FQCN contains it
+     *    contributes its declared methods (and its constructors), because "watch what
+     *    this class does" is the common case.
+     *  - `com.foo.Bar#save` — an explicit class and method fragment.
+     *  - `save` — a method-name fragment across the loaded classes. This is the
+     *    expensive one: it has to reflect over classes whose *name* did not match, so
+     *    it stops after [METHOD_SCAN_MS] or [METHOD_SCAN_CLASSES], whichever comes
+     *    first, and says so in the reply instead of blocking the panel.
+     *
+     * Argument types are returned as their real names (`int`, `java.lang.String`) so
+     * the page can hand them straight back to [resolveMethod] — no lossy
+     * `simpleName` round trip in between.
+     */
+    fun search(loader: ClassLoader, query: String, limit: Int = SEARCH_LIMIT): SearchResult {
+        val text = query.trim()
+        if (text.isEmpty()) return SearchResult(emptyList(), 0, false)
+
+        val hash = text.indexOf('#')
+        val classPart = if (hash >= 0) text.substring(0, hash).trim() else text
+        val methodPart = if (hash >= 0) text.substring(hash + 1).trim() else ""
+
+        val classes = loadedClasses(loader)
+        val out = ArrayList<MethodRef>()
+        val seen = HashSet<String>()
+
+        // Pass 1: classes whose name matches the query.
+        for (cls in classes) {
+            if (out.size >= limit) break
+            if (!cls.name.contains(classPart, ignoreCase = true)) continue
+            collectMethods(cls, methodPart, limit, out, seen)
+        }
+
+        // Pass 2: method names, but only when the user is not asking for a whole
+        // class and pass 1 found little. Bounded by time and by class count.
+        val wantsMethodScan = methodPart.isNotEmpty() || out.size < limit / 3
+        var timedOut = false
+        if (wantsMethodScan && out.size < limit) {
+            val deadline = System.nanoTime() + METHOD_SCAN_MS * 1_000_000L
+            val needle = methodPart.ifEmpty { classPart }
+            var scanned = 0
+            for (cls in classes) {
+                if (out.size >= limit) break
+                if (needle.isEmpty()) break
+                if (scanned >= METHOD_SCAN_CLASSES || System.nanoTime() > deadline) {
+                    timedOut = true
+                    break
+                }
+                scanned++
+                collectMethods(cls, needle, limit, out, seen, constructors = false)
+            }
+        }
+
+        return SearchResult(out, classes.size, timedOut)
+    }
+
+    /**
+     * Adds one class's methods — **and its superclasses'** — to [out], skipping
+     * duplicates.
+     *
+     * ## Why inherited methods must be included
+     * `Class.getDeclaredMethods()` only returns what a class declares itself, and the
+     * method a user most often wants to watch is inherited: an Activity's `onResume`
+     * lives in a base class or in `android.app.Activity`, a Fragment's `onCreateView`
+     * in `androidx.fragment.app.Fragment`. Without the walk, searching
+     * `MainActivity#onResume` returned **zero** results for a method that plainly
+     * exists and is plainly called — measured on the test device.
+     *
+     * The entry is labelled with the class that *declares* the method, so the page can
+     * hand it straight back to [resolveMethod] and the hook is installed on the real
+     * `Executable`.
+     *
+     * Constructors are included by default: "watch the constructor of this class" is
+     * the usual way to see what an Activity is built with, and their parameter list
+     * is what makes the overload picker meaningful. They belong to the matched class
+     * only, so they are never collected from a superclass.
+     */
+    private fun collectMethods(
+        cls: Class<*>,
+        methodPattern: String,
+        limit: Int,
+        out: MutableList<MethodRef>,
+        seen: MutableSet<String>,
+        constructors: Boolean = true,
+    ) {
+        if (constructors) {
+            val ctors = runCatching { cls.declaredConstructors }.getOrDefault(emptyArray())
+            for (c in ctors) {
+                if (out.size >= limit) return
+                if (methodPattern.isNotEmpty() &&
+                    !"<init>".contains(methodPattern, ignoreCase = true)
+                ) {
+                    continue
+                }
+                val ref = MethodRef.ofConstructor(cls, c)
+                if (seen.add(ref.signature)) out.add(ref)
+            }
+        }
+
+        var current: Class<*>? = cls
+        var depth = 0
+        while (current != null && depth < MAX_SUPER_DEPTH) {
+            val methods = runCatching { current.declaredMethods }.getOrDefault(emptyArray())
+            for (m in methods) {
+                if (out.size >= limit) return
+                if (methodPattern.isNotEmpty() &&
+                    !m.name.contains(methodPattern, ignoreCase = true)
+                ) {
+                    continue
+                }
+                val ref = MethodRef.of(current, m)
+                if (seen.add(ref.signature)) out.add(ref)
+            }
+            val superClass = current.superclass
+            if (superClass == null || superClass == Any::class.java) break
+            current = superClass
+            depth++
+        }
+    }
+
+    /** What a [search] matched, plus whether the scan stopped early. */
+    data class SearchResult(
+        val methods: List<MethodRef>,
+        val classesScanned: Int,
+        val truncated: Boolean,
+    )
+
     /** Resolves an exact method by name and parameter type names. */
     fun resolveMethod(
         loader: ClassLoader,
@@ -170,11 +300,38 @@ internal object DebugEngine {
         val cls = runCatching { Class.forName(className, false, loader) }.getOrNull() ?: return null
         val types = paramTypes.map { resolveType(it, loader) }.toTypedArray()
 
-        if (methodName == "<init>") {
-            return runCatching { cls.getDeclaredConstructor(*types) }.getOrNull()
-        }
         if (methodName == "<clinit>") return null
-        return runCatching { cls.getDeclaredMethod(methodName, *types) }.getOrNull()
+        return resolveExecutable(cls, methodName, types)
+    }
+
+    /**
+     * Finds a method on [cls] **or any of its superclasses**.
+     *
+     * `getDeclaredMethod` does not walk the hierarchy, so a strict lookup reports
+     * "not found" for exactly the methods people watch first (`onResume`,
+     * `onCreateView`, `setContentView`). The walk is bounded and stops before
+     * `java.lang.Object`, so a search never turns up `toString`/`equals`.
+     */
+    private fun resolveExecutable(
+        cls: Class<*>,
+        methodName: String,
+        types: Array<Class<*>>,
+    ): Executable? {
+        var current: Class<*>? = cls
+        var depth = 0
+        while (current != null && depth < MAX_SUPER_DEPTH) {
+            if (methodName == "<init>") {
+                return runCatching { current.getDeclaredConstructor(*types) }.getOrNull()
+            }
+            runCatching { current.getDeclaredMethod(methodName, *types) }
+                .getOrNull()
+                ?.let { return it }
+            val superClass = current.superclass
+            if (superClass == null || superClass == Any::class.java) break
+            current = superClass
+            depth++
+        }
+        return null
     }
 
     private fun resolveType(name: String, loader: ClassLoader): Class<*> = when (name) {
@@ -268,6 +425,31 @@ internal object DebugEngine {
 
     fun snapshot(): List<HookInfo> = hooks.values.map { it.info() }
 
+    // -----------------------------------------------------------------------
+    // Recorded calls (the 调试 tab's live view)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Calls recorded for one hook, oldest first.
+     *
+     * @param since only entries with `seq > since` are returned, so the page can poll
+     *   incrementally instead of re-downloading the ring every 700 ms.
+     * @param limit hard cap on the reply size.
+     * @return null when no hook has that id (a page that outlived an unhook).
+     */
+    fun calls(id: String, since: Long, limit: Int = MAX_CALLS_PER_HOOK): CallsPage? {
+        val state = hooks[id] ?: return null
+        return state.calls(since, limit)
+    }
+
+    /** Drops the recorded calls of one hook, keeping the hook installed. */
+    fun clearCalls(id: String): Boolean = hooks[id]?.clearCalls() ?: false
+
+    /** Drops every recorded call of every hook. */
+    fun clearAllCalls() {
+        hooks.values.forEach { it.clearCalls() }
+    }
+
     fun describe(target: Executable): String {
         val params = target.parameterTypes.joinToString(",") { it.simpleName }
         val owner = target.declaringClass.name
@@ -300,6 +482,35 @@ internal object DebugEngine {
         val calls: Long,
         val returnOverride: String?,
         val trace: Boolean,
+        /** True when this hook keeps a ring of call entries for the 调试 tab. */
+        val recording: Boolean = false,
+        /** Entries currently held in that ring. */
+        val recorded: Int = 0,
+    )
+
+    /** One recorded invocation: the arguments and what came back. */
+    data class CallEntry(
+        val seq: Long,
+        /** `System.currentTimeMillis()` at entry. */
+        val atMillis: Long,
+        val thread: String,
+        /** Argument values, formatted, one string per parameter. */
+        val args: List<String>,
+        /** Return value as text, or null when the method returned void. */
+        val result: String?,
+        /** Exception class and message when the call threw, else null. */
+        val threw: String?,
+        val durationMs: Long,
+    )
+
+    /** A page of recorded calls plus the cursor the page should ask from next. */
+    data class CallsPage(
+        val entries: List<CallEntry>,
+        val next: Long,
+        val total: Int,
+        /** Entries evicted because the ring was full, since the process started. */
+        val dropped: Long,
+        val hookCalls: Long,
     )
 
     private class HookState(
@@ -313,9 +524,30 @@ internal object DebugEngine {
 
         private val calls = AtomicLong(0)
 
+        /**
+         * Recorded calls, oldest first.
+         *
+         * `ArrayDeque` guarded by [callLock] rather than a concurrent collection: the
+         * hook runs on whatever thread called the target method (frequently the main
+         * thread of the host app), and a lock-free structure with the "drop the
+         * oldest" policy this needs is more code than the contention justifies.
+         */
+        private val callLog = ArrayDeque<CallEntry>()
+
+        private val callLock = Any()
+        private val callSeq = AtomicLong(0)
+        private val callDropped = AtomicLong(0)
+
         fun onCall(chain: XposedInterface.Chain): Any? {
             val n = calls.incrementAndGet()
             val b = behavior
+            var proceeded = false
+
+            // Only pay for formatting arguments when recording was asked for: this
+            // code runs inside a hooked method, on the host app's own thread.
+            val recording = b.record && shouldLog(n, b.recordEvery)
+            val startedNs = if (recording) System.nanoTime() else 0L
+            val argsText = if (recording) captureArgs(chain) else emptyList()
 
             return try {
                 if (b.trace && shouldLog(n, b.traceEvery)) {
@@ -347,14 +579,24 @@ internal object DebugEngine {
                     // skipping changes side effects, which is usually not wanted
                     // for a pure "fake the return value" edit.
                     runCatching {
+                        proceeded = true
                         if (argsChanged) chain.proceed(args.toTypedArray()) else chain.proceed()
                     }
                     if (b.trace) {
                         RegTrailLog.i("[$id] return forced → ${stringify(b.returnOverride)}")
                     }
+                    if (recording) {
+                        appendCall(
+                            argsText = argsText,
+                            result = stringify(b.returnOverride),
+                            threw = null,
+                            startedNs = startedNs,
+                        )
+                    }
                     return b.returnOverride
                 }
 
+                proceeded = true
                 val result = if (argsChanged) {
                     chain.proceed(args.toTypedArray())
                 } else {
@@ -364,13 +606,94 @@ internal object DebugEngine {
                 if (b.trace && shouldLog(n, b.traceEvery)) {
                     RegTrailLog.i("[$id] returned ${stringify(result)}")
                 }
+                if (recording) {
+                    appendCall(
+                        argsText = argsText,
+                        result = stringify(result),
+                        threw = null,
+                        startedNs = startedNs,
+                    )
+                }
                 result
             } catch (t: Throwable) {
+                if (proceeded) {
+                    // The **target** threw. Record it and let the exception travel to
+                    // the caller: calling the origin a second time here (which is what
+                    // this used to do) would run the method's side effects twice — a
+                    // debugger must never change the behaviour of the method it
+                    // watches, and a method that throws is exactly where that matters.
+                    if (recording) {
+                        appendCall(
+                            argsText = argsText,
+                            result = null,
+                            threw = "${t.javaClass.name}: ${t.message ?: ""}".trim(),
+                            startedNs = startedNs,
+                        )
+                    }
+                    throw t
+                }
                 RegTrailLog.w("[$id] hook error", t)
                 // PROTECTIVE mode already contains this, but be explicit: never
                 // let a debugger bug change the target's behaviour silently.
-                chain.proceed()
+                return chain.proceed()
             }
+        }
+
+        /** Formats the live arguments for the 调试 tab; never throws. */
+        private fun captureArgs(chain: XposedInterface.Chain): List<String> = runCatching {
+            chain.args.map { truncate(stringify(it)) }
+        }.getOrDefault(emptyList())
+
+        private fun appendCall(
+            argsText: List<String>,
+            result: String?,
+            threw: String?,
+            startedNs: Long,
+        ) {
+            runCatching {
+                val entry = CallEntry(
+                    seq = callSeq.incrementAndGet(),
+                    atMillis = System.currentTimeMillis(),
+                    thread = Thread.currentThread().name,
+                    args = argsText,
+                    result = result?.let { truncate(it) },
+                    threw = threw,
+                    durationMs = (System.nanoTime() - startedNs) / 1_000_000L,
+                )
+                synchronized(callLock) {
+                    callLog.addLast(entry)
+                    while (callLog.size > MAX_CALLS_PER_HOOK) {
+                        callLog.removeFirst()
+                        callDropped.incrementAndGet()
+                    }
+                }
+            }.onFailure {
+                // Recording must never disturb the host app; swallowing here is the
+                // whole point of the try/catch.
+                RegTrailLog.w("[$id] cannot record call", it)
+            }
+        }
+
+        fun calls(since: Long, limit: Int): CallsPage {
+            val snapshot: List<CallEntry>
+            val dropped: Long
+            synchronized(callLock) {
+                snapshot = if (since <= 0L) callLog.toList() else callLog.filter { it.seq > since }
+                dropped = callDropped.get()
+            }
+            val page = if (snapshot.size > limit) snapshot.takeLast(limit) else snapshot
+            return CallsPage(
+                entries = page,
+                next = page.lastOrNull()?.seq ?: since,
+                total = snapshot.size,
+                dropped = dropped,
+                hookCalls = calls.get(),
+            )
+        }
+
+        fun clearCalls(): Boolean {
+            synchronized(callLock) { callLog.clear() }
+            return true
         }
 
         private fun shouldLog(n: Long, every: Long): Boolean =
@@ -385,6 +708,8 @@ internal object DebugEngine {
                 ?.takeIf { it !== NO_OVERRIDE }
                 ?.let { stringify(it) },
             trace = behavior.trace,
+            recording = behavior.record,
+            recorded = synchronized(callLock) { callLog.size },
         )
     }
 
@@ -399,6 +724,46 @@ internal object DebugEngine {
         is Array<*> -> value.joinToString(prefix = "[", postfix = "]") { stringify(it) }
         else -> runCatching { value.toString() }.getOrDefault("<unprintable>")
     }
+
+    /** Keeps one recorded value short enough to render in a 300 dp panel. */
+    private fun truncate(text: String): String =
+        if (text.length <= MAX_VALUE_CHARS) text else text.take(MAX_VALUE_CHARS) + "…"
+
+    /**
+     * How many calls one hook keeps for the 调试 tab.
+     *
+     * A hot method can run thousands of times per second; a ring this size is what
+     * makes the feature safe to leave installed, and the page caps what it renders on
+     * top of that.
+     */
+    const val MAX_CALLS_PER_HOOK = 200
+
+    /** How long one recorded argument/return value may be. */
+    private const val MAX_VALUE_CHARS = 160
+
+    /** How many methods one search returns. */
+    const val SEARCH_LIMIT = 60
+
+    /**
+     * Time budget for the expensive method-name pass of [search].
+     *
+     * The search runs on the JS bridge thread, which the panel needs to stay
+     * responsive. 250 ms is invisible for a manual query and bounds the damage on a
+     * process with thousands of loaded classes.
+     */
+    private const val METHOD_SCAN_MS = 250L
+
+    /** How many classes the method-name pass may reflect over. */
+    private const val METHOD_SCAN_CLASSES = 900
+
+    /**
+     * How many superclasses [collectMethods] / [resolveExecutable] walk.
+     *
+     * Deep enough for the real hierarchies in an Android app (Activity ← BaseActivity
+     * ← FragmentActivity ← ComponentActivity ← …), shallow enough that a broad search
+     * cannot spend its whole budget on `java.lang.Object`.
+     */
+    private const val MAX_SUPER_DEPTH = 8
 }
 
 /** Everything that controls how one hook behaves. */
@@ -409,6 +774,16 @@ internal data class HookBehavior(
     val trace: Boolean = false,
     /** Log every Nth call; 1 means every call. */
     val traceEvery: Long = 1,
+    /**
+     * Keep the arguments and the return value of each call for the 调试 tab.
+     *
+     * Separate from [trace]: tracing writes to the framework log, recording keeps the
+     * values in a bounded ring the floating window can poll. A debugger that wants to
+     * *see* calls live needs the latter without necessarily spamming the log.
+     */
+    val record: Boolean = false,
+    /** Record every Nth call; 1 means every call. */
+    val recordEvery: Long = 1,
     /**
      * When set to anything other than [DebugEngine.NO_OVERRIDE], this value is
      * returned instead of the original result. `null` is a legitimate forced

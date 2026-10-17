@@ -31,14 +31,17 @@ import io.github.wg1337.regtrail.xposed.bridge.BridgeDispatcher
 import io.github.wg1337.regtrail.xposed.bridge.ModuleSession
 import io.github.wg1337.regtrail.xposed.debug.ActivityTracker
 import io.github.wg1337.regtrail.xposed.debug.DebugEngine
+import io.github.wg1337.regtrail.xposed.debug.DebugHookBehavior
 import io.github.wg1337.regtrail.xposed.debug.InstanceRegistry
 import io.github.wg1337.regtrail.xposed.hook.TargetRegistry
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -103,6 +106,18 @@ internal class OverlayController(
     private var offsetY = 0
 
     /**
+     * Window offset at the moment a header drag started, in pixels.
+     *
+     * The page sends the **total** delta since the finger went down rather than a
+     * per-frame increment, so the native side only has to add that delta to this
+     * origin. That makes the operation idempotent: a duplicated or reordered
+     * message cannot accumulate drift, and the clamp is applied to an absolute
+     * position every time instead of to a running sum.
+     */
+    private var dragOriginOffsetX = 0
+    private var dragOriginOffsetY = 0
+
+    /**
      * Size of the **expanded** panel, in dp.
      *
      * Volatile because it is written on the main thread (a resize drag, an
@@ -120,6 +135,15 @@ internal class OverlayController(
 
     /** Remembers a dragged size across target-process restarts. */
     private var sizeStore: OverlaySizeStore? = null
+
+    /**
+     * Source of the numeric hook ids the 调试 tab hands out.
+     *
+     * The page's protocol is `{"hookId":N}`, so the ids it sees are plain numbers
+     * rather than the engine's `h1`/`h2` strings. Both remain valid ids inside
+     * [DebugEngine]; the Agent's own hooks simply report `hookId: 0` in the list.
+     */
+    private val debugHookSeq = AtomicInteger(0)
 
     /**
      * The size the *published config* asked for.
@@ -330,6 +354,22 @@ internal class OverlayController(
 
         offsetX = (snapshot.overlayDefaultX * screenWidth(wm)).toInt()
         offsetY = (snapshot.overlayDefaultY * screenHeight(wm)).toInt()
+        // A position the user dragged a previous run to comes back here, clamped to
+        // the *current* display: a window parked near the right edge in landscape
+        // would otherwise open off-screen after a rotation.
+        sizeStore?.position()?.let { saved ->
+            offsetX = saved.first
+            offsetY = saved.second
+        }
+        // Whichever of the two sources won, the panel must open reachable: the
+        // published default is a fraction of a screen that may have rotated since,
+        // and a remembered drag is a pair of pixels from that older screen.
+        snapIntoBounds(
+            context,
+            wm,
+            dp(context, panelSizeDp.first.toFloat()),
+            dp(context, panelSizeDp.second.toFloat()),
+        )
 
         val lp = buildLayoutParams(context, snapshot)
         params = lp
@@ -385,6 +425,10 @@ internal class OverlayController(
             app = app,
             handler = { action, payload -> onWebMessage(action, payload) },
             onCollapsed = { collapsed -> applyCollapsed(collapsed) },
+            // A position the user dragged the panel to survives the target process
+            // being killed. The fallback clamps it once the container is laid out,
+            // so a saved value from a bigger screen cannot hide the panel.
+            savedMargins = sizeStore?.margins(),
         )
         fallback.applyConfig(snapshot.toJsonString())
         RegTrailLog.recent(80).forEach { fallback.appendLog(it) }
@@ -866,6 +910,11 @@ internal class OverlayController(
         // window outside the screen and make it unreachable.
         "resize" -> webResize(payloadJson)
 
+        // Header drag of the *expanded* panel. Split into three messages because
+        // the origin has to be captured once per gesture — see `webDragBegin`.
+        "dragBegin" -> webDragBegin()
+        "dragMove" -> webDragMove(payloadJson)
+
         // Log tail for the 日志 tab. The page polls this and only while that tab
         // is visible, so an idle window costs nothing.
         "logs" -> webLogs()
@@ -889,6 +938,12 @@ internal class OverlayController(
         "memRevert" -> webMemRevert(payloadJson)
         "memSessions" -> webMemSessions()
         "memClear" -> webMemClear()
+
+        // 「诊断」: a plain-text report of everything that decides whether the 内存
+        // tab can work (maps, the region filter, /proc/self/mem read+write, a sample
+        // page read through each transport). This is the cheapest possible answer to
+        // "内存搜索不可用" on an unknown ROM, so it ships even when nothing is wrong.
+        "memProbe" -> webMemProbe()
         "jobPoll" -> webJobPoll(payloadJson)
         "jobCancel" -> webJobCancel(payloadJson)
 
@@ -897,6 +952,14 @@ internal class OverlayController(
         "agentChat" -> webAgentChat(payloadJson)
         "agentState" -> webAgentState()
         "agentReset" -> webAgentReset()
+
+        // ---- 调试：选定一个方法，实时看它的参数与返回值 ------------------
+        "debugSearch" -> webDebugSearch(payloadJson)
+        "debugHook" -> webDebugHook(payloadJson)
+        "debugCalls" -> webDebugCalls(payloadJson)
+        "debugUnhook" -> webDebugUnhook(payloadJson)
+        "debugHooks" -> webDebugHooks()
+        "debugClear" -> webDebugClear(payloadJson)
 
         "status" -> webStatusJson()
 
@@ -962,9 +1025,158 @@ internal class OverlayController(
         )
     }
 
+    // -----------------------------------------------------------------------
+    // Header drag of the expanded panel
+    // -----------------------------------------------------------------------
+
+    /**
+     * Starts a drag of the expanded panel by its title bar.
+     *
+     * ## Why the origin is captured natively
+     * The page reports the **total** finger travel since `pointerdown`, not a
+     * per-frame increment. Native code therefore has to remember where the window
+     * was when the gesture started; adding a total delta to a fixed origin keeps
+     * every frame independent, so a coalesced (`requestAnimationFrame`), delayed or
+     * duplicated message can only ever produce the same clamped position — never
+     * drift.
+     *
+     * ## Why the bounds are returned
+     * The page draws the panel at the finger *immediately* and lets native code
+     * catch up (the same local-first strategy as the resize grip). Without the
+     * bounds it would happily drag the panel past the screen edge and snap back on
+     * release, so native code hands over the exact `[min,max]` travel in dp and the
+     * page clamps its own transform to it.
+     */
+    private fun webDragBegin(): String {
+        val collapsedNow = overlayView?.isCollapsed == true || decorFallback?.isCollapsed == true
+        if (collapsedNow) return webError("折叠状态下请拖动胶囊本身")
+
+        val decor = decorFallback
+        if (decor != null && decor.isAttached) {
+            decor.beginDrag()
+            val bounds = decor.dragBoundsDp()
+            return webOk(
+                buildJsonObject {
+                    put("mechanism", JsonPrimitive("DecorView"))
+                    dragBounds(bounds).forEach { (key, element) -> put(key, element) }
+                },
+            )
+        }
+
+        val context = appContext ?: return webError("窗口尚未挂载")
+        val wm = windowManager ?: return webError("窗口尚未挂载")
+        val lp = params ?: return webError("窗口尚未挂载")
+        val view = overlayView ?: return webError("窗口尚未挂载")
+        if (view.parent == null) return webError("窗口尚未显示")
+
+        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+        val keep = dp(context, KEEP_ON_SCREEN_DP)
+
+        dragOriginOffsetX = offsetX
+        dragOriginOffsetY = offsetY
+
+        // The same rule `moveBy` applies to the collapsed pill: keep a grabbable
+        // margin on screen in every direction.
+        val deltaMinX = keep - lp.width - offsetX
+        val deltaMaxX = maxOf(deltaMinX, screenWidth(wm) - keep - offsetX)
+        val deltaMinY = -offsetY
+        val deltaMaxY = maxOf(deltaMinY, screenHeight(wm) - keep - offsetY)
+
+        return webOk(
+            buildJsonObject {
+                put("mechanism", JsonPrimitive("ApplicationOverlay"))
+                dragBounds(
+                    intArrayOf(
+                        (deltaMinX / density).toInt(),
+                        (deltaMaxX / density).toInt(),
+                        (deltaMinY / density).toInt(),
+                        (deltaMaxY / density).toInt(),
+                    ),
+                ).forEach { (key, element) -> put(key, element) }
+            },
+        )
+    }
+
+    /**
+     * Applies one frame of a header drag: `{"dx":12,"dy":-3,"final":false}`.
+     *
+     * `dx`/`dy` are **dp** (CSS pixels inside the WebView are dp at scale 1), which
+     * is the unit the page measures in. The reply carries the delta that was really
+     * applied after clamping, so the page can compute the residue its local
+     * transform still has to draw (`wanted - applied`).
+     */
+    private fun webDragMove(payloadJson: String): String {
+        val dxDp = payloadInt(payloadJson, "dx") ?: 0
+        val dyDp = payloadInt(payloadJson, "dy") ?: 0
+        val isFinal = payloadBool(payloadJson, "final") ?: false
+
+        val decor = decorFallback
+        if (decor != null && decor.isAttached) {
+            val applied = decor.dragToDp(dxDp, dyDp)
+            if (isFinal && applied != 0 to 0) {
+                val margins = decor.marginsPx()
+                sizeStore?.rememberMargins(margins.first, margins.second)
+            }
+            return webOk(
+                buildJsonObject {
+                    put("dx", JsonPrimitive(applied.first))
+                    put("dy", JsonPrimitive(applied.second))
+                    put("final", JsonPrimitive(isFinal))
+                },
+            )
+        }
+
+        val context = appContext ?: return webError("窗口尚未挂载")
+        val wm = windowManager ?: return webError("窗口尚未挂载")
+        val lp = params ?: return webError("窗口尚未挂载")
+        val view = overlayView ?: return webError("窗口尚未挂载")
+        if (view.isCollapsed) return webError("折叠状态下不可拖动")
+
+        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+        val keep = dp(context, KEEP_ON_SCREEN_DP)
+        val minX = keep - lp.width
+        val maxX = maxOf(minX, screenWidth(wm) - keep)
+        val minY = 0
+        val maxY = maxOf(0, screenHeight(wm) - keep)
+
+        val targetX = (dragOriginOffsetX + (dxDp * density).toInt()).coerceIn(minX, maxX)
+        val targetY = (dragOriginOffsetY + (dyDp * density).toInt()).coerceIn(minY, maxY)
+        val appliedDx = ((targetX - dragOriginOffsetX) / density).toInt()
+        val appliedDy = ((targetY - dragOriginOffsetY) / density).toInt()
+
+        // The layout write must happen on the view's own thread; the reply does not
+        // wait for it because the clamp above already decided the final position.
+        main.post {
+            offsetX = targetX
+            offsetY = targetY
+            lp.x = offsetX
+            lp.y = offsetY
+            runCatching { wm.updateViewLayout(view, lp) }
+        }
+
+        // Persist once per gesture, never per frame: `final` is what the page sends
+        // on pointer-up (the same contract the resize grip uses).
+        if (isFinal) sizeStore?.rememberPosition(targetX, targetY)
+
+        return webOk(
+            buildJsonObject {
+                put("dx", JsonPrimitive(appliedDx))
+                put("dy", JsonPrimitive(appliedDy))
+                put("final", JsonPrimitive(isFinal))
+            },
+        )
+    }
+
+    /** `[minDx, maxDx, minDy, maxDy]` → the four named fields the page reads. */
+    private fun dragBounds(bounds: IntArray): Map<String, JsonPrimitive> = mapOf(
+        "minDx" to JsonPrimitive(bounds[0]),
+        "maxDx" to JsonPrimitive(bounds[1]),
+        "minDy" to JsonPrimitive(bounds[2]),
+        "maxDy" to JsonPrimitive(bounds[3]),
+    )
+
     /** The last [LOG_TAIL] log lines, as the 日志 tab's data source. */
-    private fun webLogs(): String {
-        val lines = RegTrailLog.recent(LOG_TAIL)
+    private fun webLogs(): String {        val lines = RegTrailLog.recent(LOG_TAIL)
         return webOk(
             buildJsonObject {
                 put(
@@ -1172,6 +1384,20 @@ internal class OverlayController(
     private fun webMemSessions(): String = runCatching {
         webOk(MemorySessions.describe())
     }.getOrElse { webError(it.message ?: "读取内存状态失败") }
+
+    /**
+     * Runs the memory diagnostics: `{"action":"memProbe"}`.
+     *
+     * Deliberately synchronous. It opens two file descriptors, parses `/proc/self/maps`
+     * once and reads one 4 KiB page — milliseconds, not the seconds a scan takes — and
+     * the page shows the text immediately instead of polling for it.
+     */
+    private fun webMemProbe(): String = runCatching {
+        webOk(MemorySessions.probe())
+    }.getOrElse {
+        RegTrailLog.w("memProbe failed", it)
+        webError(it.message ?: "内存诊断失败")
+    }
 
     /** Drops every session and forgets the remembered originals. */
     private fun webMemClear(): String = runCatching {
@@ -1424,6 +1650,265 @@ internal class OverlayController(
             ) == PackageManager.PERMISSION_GRANTED
         }.getOrDefault(false)
     }
+
+    // -----------------------------------------------------------------------
+    // 调试 tab — watch one method's arguments and return value live
+    // -----------------------------------------------------------------------
+
+    /**
+     * `{"query":"Login"}` → the methods it matches.
+     *
+     * Runs on the bridge thread: it only touches already-loaded classes through the
+     * cached class list, and `DebugEngine.search` bounds the expensive part in time.
+     */
+    private fun webDebugSearch(payloadJson: String): String {
+        val query = payloadString(payloadJson, "query") ?: return webError("请输入类名或方法名")
+        val limit = (payloadInt(payloadJson, "limit") ?: DebugEngine.SEARCH_LIMIT)
+            .coerceIn(1, DebugEngine.SEARCH_LIMIT)
+
+        val startedAt = System.nanoTime()
+        val result = runCatching {
+            DebugEngine.search(param.defaultClassLoader, query, limit)
+        }.getOrElse {
+            RegTrailLog.w("ui: debugSearch failed", it)
+            return webError(it.message ?: "搜索失败")
+        }
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+        RegTrailLog.d(
+            "ui: debugSearch '$query' → ${result.methods.size} 个方法 " +
+                "(${result.classesScanned} 个类, ${elapsedMs}ms, truncated=${result.truncated})",
+        )
+
+        return webOk(
+            buildJsonObject {
+                put("query", JsonPrimitive(query))
+                put("count", JsonPrimitive(result.methods.size))
+                put("classesScanned", JsonPrimitive(result.classesScanned))
+                put("truncated", JsonPrimitive(result.truncated))
+                put("elapsedMs", JsonPrimitive(elapsedMs))
+                put(
+                    "methods",
+                    buildJsonArray {
+                        result.methods.forEach { ref ->
+                            add(
+                                buildJsonObject {
+                                    put("className", JsonPrimitive(ref.className))
+                                    put("methodName", JsonPrimitive(ref.methodName))
+                                    put("returnType", JsonPrimitive(ref.returnType))
+                                    put("isStatic", JsonPrimitive(ref.isStatic))
+                                    put("signature", JsonPrimitive(ref.signature))
+                                    put(
+                                        "params",
+                                        buildJsonArray {
+                                            ref.paramTypes.forEach { add(JsonPrimitive(it)) }
+                                        },
+                                    )
+                                },
+                            )
+                        }
+                    },
+                )
+            },
+        )
+    }
+
+    /**
+     * `{"className":"…","methodName":"…","params":["int"],"mode":"trace"}`.
+     *
+     * Modes:
+     *  - `trace` (default) — record the call: arguments and return value;
+     *  - `return` — record *and* force the returned value;
+     *  - `args` — record *and* replace one argument (`value` is `index=value`).
+     *
+     * The hook is installed through [DebugEngine.installHook], which uses
+     * `ExceptionMode.PROTECTIVE`: a bug in this debugger must never take the host app
+     * down. The recorded id is a plain number so the page can send it back as
+     * `hookId`.
+     */
+    private fun webDebugHook(payloadJson: String): String {
+        val className = payloadString(payloadJson, "className")
+            ?: return webError("缺少 className")
+        val methodName = payloadString(payloadJson, "methodName")
+            ?: return webError("缺少 methodName")
+        val paramTypes = payloadStringArray(payloadJson, "params")
+        val mode = (payloadString(payloadJson, "mode") ?: "trace").lowercase()
+        val value = payloadString(payloadJson, "value")
+        val every = (payloadInt(payloadJson, "every") ?: 1).coerceAtLeast(1).toLong()
+
+        val target = DebugEngine.resolveMethod(
+            loader = param.defaultClassLoader,
+            className = className,
+            methodName = methodName,
+            paramTypes = paramTypes,
+        )
+        if (target == null) {
+            val shown = paramTypes.joinToString(",")
+            return webError("找不到方法：$className#$methodName($shown)")
+        }
+
+        val behavior = when (mode) {
+            "return" -> DebugHookBehavior.forceReturn(
+                value = value,
+                valueType = payloadString(payloadJson, "valueType") ?: "auto",
+                trace = true,
+            ).copy(record = true, recordEvery = every)
+
+            "args" -> {
+                val (index, raw) = parseArgOverride(value)
+                val types = target.parameterTypes
+                if (index !in types.indices) {
+                    return webError("参数下标 $index 超出范围（共 ${types.size} 个参数）")
+                }
+                val coerced = AgentTools.coerce(raw, types[index], "auto")
+                    ?: return webError("无法把「$raw」转换为 ${types[index].name}")
+                DebugHookBehavior.replaceArg(index = index, value = coerced, trace = true)
+                    .copy(record = true, recordEvery = every)
+            }
+
+            else -> DebugHookBehavior.record(every = every)
+        }
+
+        // Numeric ids: the documented protocol is `{"hookId":N}`.
+        val hookNumber = debugHookSeq.incrementAndGet()
+        val id = DebugEngine.installHook(
+            target = target,
+            behavior = behavior.copy(id = hookNumber.toString()),
+            label = DebugEngine.describe(target),
+        ).getOrElse { return webError("安装 Hook 失败：${it.message}") }
+
+        RegTrailLog.i("ui: debugHook $id → ${DebugEngine.describe(target)} mode=$mode")
+        return webOk(
+            buildJsonObject {
+                put("hookId", JsonPrimitive(hookNumber))
+                put("id", JsonPrimitive(id))
+                put("target", JsonPrimitive(DebugEngine.describe(target)))
+                put("mode", JsonPrimitive(mode))
+                put("recording", JsonPrimitive(true))
+            },
+        )
+    }
+
+    /**
+     * `{"hookId":1,"since":123}` → the recorded calls with `seq > since`.
+     *
+     * The page polls this only for the hooks it is watching and only while the 调试
+     * tab is visible, and it sends the `next` cursor it got back, so an idle panel
+     * costs one empty reply per tick.
+     */
+    private fun webDebugCalls(payloadJson: String): String {
+        val hookId = payloadInt(payloadJson, "hookId")
+            ?: return webError("debugCalls 需要 hookId")
+        val since = (payloadInt(payloadJson, "since") ?: 0).toLong()
+        val limit = (payloadInt(payloadJson, "limit") ?: DebugEngine.MAX_CALLS_PER_HOOK)
+            .coerceIn(1, DebugEngine.MAX_CALLS_PER_HOOK)
+
+        val page = DebugEngine.calls(hookId.toString(), since, limit)
+            ?: return webError("Hook $hookId 不存在（可能已解除）")
+
+        return webOk(
+            buildJsonObject {
+                put("hookId", JsonPrimitive(hookId))
+                put("next", JsonPrimitive(page.next))
+                put("total", JsonPrimitive(page.total))
+                put("dropped", JsonPrimitive(page.dropped))
+                put("calls", JsonPrimitive(page.hookCalls))
+                put(
+                    "entries",
+                    buildJsonArray {
+                        page.entries.forEach { entry ->
+                            add(
+                                buildJsonObject {
+                                    put("seq", JsonPrimitive(entry.seq))
+                                    put("at", JsonPrimitive(entry.atMillis))
+                                    put("thread", JsonPrimitive(entry.thread))
+                                    put("ms", JsonPrimitive(entry.durationMs))
+                                    put(
+                                        "args",
+                                        buildJsonArray {
+                                            entry.args.forEach { add(JsonPrimitive(it)) }
+                                        },
+                                    )
+                                    put("result", BridgeApi.toJsonElement(entry.result))
+                                    put("threw", BridgeApi.toJsonElement(entry.threw))
+                                },
+                            )
+                        }
+                    },
+                )
+            },
+        )
+    }
+
+    /** `{"hookId":1}` → removes the hook. Always reachable from the page. */
+    private fun webDebugUnhook(payloadJson: String): String {
+        val hookId = payloadInt(payloadJson, "hookId")
+            ?: return webError("debugUnhook 需要 hookId")
+        val removed = DebugEngine.unhook(hookId.toString())
+        if (!removed) return webError("Hook $hookId 不存在（可能已解除）")
+        RegTrailLog.i("ui: debugUnhook $hookId")
+        return webOk(buildJsonObject { put("hookId", JsonPrimitive(hookId)) })
+    }
+
+    /** Every active hook with its call count: the 调试 tab's header list. */
+    private fun webDebugHooks(): String {
+        val hooks = DebugEngine.snapshot()
+        return webOk(
+            buildJsonObject {
+                put("count", JsonPrimitive(hooks.size))
+                put(
+                    "hooks",
+                    buildJsonArray {
+                        hooks.forEach { info ->
+                            add(
+                                buildJsonObject {
+                                    // Numeric when the 调试 tab installed it, 0 for a
+                                    // hook that came from the Agent (`hook_method`) —
+                                    // `id` is always there for display.
+                                    put("hookId", JsonPrimitive(info.id.toIntOrNull() ?: 0))
+                                    put("id", JsonPrimitive(info.id))
+                                    put("target", JsonPrimitive(info.target))
+                                    put("label", JsonPrimitive(info.label))
+                                    put("calls", JsonPrimitive(info.calls))
+                                    put("recorded", JsonPrimitive(info.recorded))
+                                    put("recording", JsonPrimitive(info.recording))
+                                    put("trace", JsonPrimitive(info.trace))
+                                    put(
+                                        "returnOverride",
+                                        BridgeApi.toJsonElement(info.returnOverride),
+                                    )
+                                },
+                            )
+                        }
+                    },
+                )
+            },
+        )
+    }
+
+    /** `{"hookId":1}` → forgets the recorded calls, keeps the hook installed. */
+    private fun webDebugClear(payloadJson: String): String {
+        val hookId = payloadInt(payloadJson, "hookId") ?: return webError("debugClear 需要 hookId")
+        val cleared = DebugEngine.clearCalls(hookId.toString())
+        if (!cleared) return webError("Hook $hookId 不存在（可能已解除）")
+        return webOk(buildJsonObject { put("hookId", JsonPrimitive(hookId)) })
+    }
+
+    /** `index=value` (or `index:value`) → the argument override a `args` hook means. */
+    private fun parseArgOverride(raw: String?): Pair<Int, String> {
+        val text = raw.orEmpty()
+        val sep = text.indexOfFirst { it == '=' || it == ':' }
+        if (sep <= 0) return 0 to text
+        val index = text.substring(0, sep).trim().toIntOrNull() ?: return 0 to text
+        return index to text.substring(sep + 1)
+    }
+
+    /** Reads a string-array field out of a bridge payload. */
+    private fun payloadStringArray(payloadJson: String, key: String): List<String> = runCatching {
+        val element = BridgeApi.json.parseToJsonElement(payloadJson).jsonObject[key]
+        (element as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            ?: emptyList()
+    }.getOrDefault(emptyList())
 
     // -----------------------------------------------------------------------
     // Helpers
