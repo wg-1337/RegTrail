@@ -10,6 +10,7 @@ import io.github.wg1337.regtrail.xposed.debug.ActivityTracker
 import io.github.wg1337.regtrail.xposed.debug.DebugEngine
 import io.github.wg1337.regtrail.xposed.debug.DebugHookBehavior
 import io.github.wg1337.regtrail.xposed.debug.InstanceRegistry
+import io.github.wg1337.regtrail.xposed.mem.MemorySessions
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -37,12 +38,16 @@ internal object AgentTools {
      *
      * @param context the target app's context, used for Activity/View inspection.
      * @param loader the target app's class loader.
+     * @param shouldStop polled by the memory tools, which can read 64 MiB. The
+     *   settings-app path passes a constant `false` (a Binder call has its own
+     *   timeout); the in-window Agent passes its job's cancellation flag.
      */
     fun run(
         name: String,
         args: JsonObject,
         context: android.content.Context?,
         loader: ClassLoader,
+        shouldStop: () -> Boolean = { false },
     ): BridgeApi.Response = try {
         when (name) {
             "list_classes" -> listClasses(args, loader)
@@ -57,6 +62,14 @@ internal object AgentTools {
             "get_static_field" -> getStaticField(args, loader)
             "call_method" -> callMethod(args, loader)
             "hook_method" -> hookMethod(args, loader)
+            // In-process memory tools. These are the same engine the 内存 tab uses
+            // (see `xposed.mem.InProcessMemory`), exposed to the Agent because "find
+            // the counter and change it" is the single most common request and it
+            // needs no pid, no root and no shell here.
+            "mem_scan" -> memScan(args, shouldStop)
+            "mem_refine" -> memRefine(args, shouldStop)
+            "mem_write" -> memWrite(args)
+            "mem_revert" -> memRevert(args)
             else -> toolError("unknown tool: $name")
         }
     } catch (t: Throwable) {
@@ -360,6 +373,93 @@ internal object AgentTools {
     }
 
     // -----------------------------------------------------------------------
+    // In-process memory
+    // -----------------------------------------------------------------------
+
+    /**
+     * First memory scan, in this process's own address space.
+     *
+     * The result is *compacted* before it reaches the Agent: a 500-hit scan is
+     * ~60 KB of JSON, which would burn most of a model's context on addresses it
+     * cannot use yet. The compact form keeps the session id, the counts and the
+     * first addresses, and only inlines per-address values when the set is small
+     * enough for a human (≤ 20) to actually look at.
+     */
+    private fun memScan(args: JsonObject, shouldStop: () -> Boolean): BridgeApi.Response = runCatching {
+        MemorySessions.scan(
+            typeRaw = args.str("type") ?: "int32",
+            value = args.str("value"),
+            writableOnly = args.bool("writableOnly") ?: false,
+            maxResults = args.int("maxResults") ?: MemorySessions.DEFAULT_MAX_RESULTS,
+            shouldStop = shouldStop,
+        )
+    }.fold(
+        onSuccess = { BridgeApi.Response(ok = true, data = compactScan(it)) },
+        onFailure = { toolError(it.message ?: "内存扫描失败") },
+    )
+
+    private fun memRefine(args: JsonObject, shouldStop: () -> Boolean): BridgeApi.Response =
+        runCatching {
+            val session = args.int("session") ?: return toolError("missing 'session'")
+            MemorySessions.refine(
+                sessionId = session,
+                value = args.str("value"),
+                typeRaw = args.str("type"),
+                maxResults = args.int("maxResults") ?: MemorySessions.DEFAULT_MAX_RESULTS,
+                shouldStop = shouldStop,
+            )
+        }.fold(
+            onSuccess = { BridgeApi.Response(ok = true, data = compactScan(it)) },
+            onFailure = { toolError(it.message ?: "二次扫描失败") },
+        )
+
+    private fun memWrite(args: JsonObject): BridgeApi.Response = runCatching {
+        MemorySessions.write(
+            addressRaw = args.str("addr") ?: args.str("address"),
+            typeRaw = args.str("type"),
+            value = args.str("value"),
+        )
+    }.fold(
+        onSuccess = { BridgeApi.Response(ok = true, data = it) },
+        onFailure = { toolError(it.message ?: "写入失败") },
+    )
+
+    private fun memRevert(args: JsonObject): BridgeApi.Response = runCatching {
+        MemorySessions.revert(args.str("addr") ?: args.str("address"))
+    }.fold(
+        onSuccess = { BridgeApi.Response(ok = true, data = it) },
+        onFailure = { toolError(it.message ?: "还原失败") },
+    )
+
+    /** Addresses only when there are many; full rows when a human can read them. */
+    private fun compactScan(data: JsonObject): JsonObject {
+        val results = data["results"] as? JsonArray ?: return data
+        val count = (data["count"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: results.size
+        return buildJsonObject {
+            for (key in listOf("session", "type", "value", "count", "truncated", "note")) {
+                val element = data[key] ?: continue
+                put(key, element)
+            }
+            put(
+                "addresses",
+                buildJsonArray {
+                    results.take(COMPACT_ADDRESS_LIMIT).forEach { row ->
+                        val address = (row as? JsonObject)?.get("addr") ?: return@forEach
+                        add(address)
+                    }
+                },
+            )
+            if (count <= COMPACT_FULL_ROWS) put("results", results)
+            put(
+                "hint",
+                JsonPrimitive(
+                    "命中较多时只给出 addresses；用 mem_refine 复核后结果会自动变小",
+                ),
+            )
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
@@ -434,6 +534,18 @@ internal object AgentTools {
             put(k, BridgeApi.toJsonElement(v))
         }
     }
+
+    /**
+     * How many addresses a compact scan result lists.
+     *
+     * The Agent only needs enough addresses to recognise the one it will refine;
+     * a full 500-address list is ~60 KB and would crowd out the class dump it also
+     * needs to reason about.
+     */
+    private const val COMPACT_ADDRESS_LIMIT = 80
+
+    /** Rows are inlined (with values) only when the set is small enough to read. */
+    private const val COMPACT_FULL_ROWS = 20
 }
 
 /** Small typed accessors so tools read cleanly. */
@@ -443,3 +555,9 @@ internal fun JsonObject.str(key: String): String? =
 internal fun JsonObject.int(key: String): Int? = str(key)?.toIntOrNull()
 
 internal fun JsonObject.long(key: String): Long? = str(key)?.toLongOrNull()
+
+/** JSON booleans *and* the strings `"true"`/`"1"`; a model may send either. */
+internal fun JsonObject.bool(key: String): Boolean? {
+    val text = str(key) ?: return null
+    return text == "true" || text == "1"
+}

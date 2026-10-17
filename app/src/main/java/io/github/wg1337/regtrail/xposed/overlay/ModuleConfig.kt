@@ -99,6 +99,13 @@ internal class ModuleConfig(private val module: XposedModule) {
         /** Published starting size of the expanded panel, in dp. */
         val overlayWidthDp: Int = OverlaySizeLimits.DEFAULT_WIDTH_DP,
         val overlayHeightDp: Int = OverlaySizeLimits.DEFAULT_HEIGHT_DP,
+        /** Whether a hook installation deoptimizes the target method first. */
+        val autoDeoptimize: Boolean = true,
+        /** Agent endpoint published for the in-window Agent (see the model KDoc). */
+        val agentBaseUrl: String = "",
+        val agentModel: String = "",
+        val agentApiKey: String = "",
+        val agentMaxRounds: Int = 0,
         val panels: List<String> = listOf("status", "log"),
         val revision: Long = 0,
         val raw: ModuleConfigSnapshot = ModuleConfigSnapshot(),
@@ -109,6 +116,15 @@ internal class ModuleConfig(private val module: XposedModule) {
             if (attachAllScoped) return true
             return packageName in targetPackages
         }
+
+        /**
+         * True when the Agent tab may talk to a model from inside this process.
+         *
+         * A key is mandatory: without one every request would 401, and a UI that
+         * offers a chat box it cannot use is worse than one that says why.
+         */
+        val agentConfigured: Boolean
+            get() = agentApiKey.isNotBlank() && agentBaseUrl.isNotBlank() && agentModel.isNotBlank()
 
         /**
          * True only when the higher-window-layer mechanism is both selected and
@@ -123,9 +139,18 @@ internal class ModuleConfig(private val module: XposedModule) {
          *
          * Built with `BridgeApi.json` rather than string concatenation so the
          * page always receives valid JSON (colours and scales included).
+         *
+         * **The API key is redacted here, not by the caller.** The page is a
+         * WebView living in a third-party app's process: anything that reaches it
+         * can be read by a `console.log`, a crash dump or the next person who
+         * attaches a debugger. The page has no use for the key (the Agent runs
+         * natively), so the one method that hands the config across the boundary
+         * is the right place to drop it, rather than trusting four call sites to
+         * remember.
          */
         fun toJsonString(): String = runCatching {
-            BridgeApi.json.encodeToString(ModuleConfigSnapshot.serializer(), raw)
+            val safe = if (raw.agentApiKey.isEmpty()) raw else raw.copy(agentApiKey = "")
+            BridgeApi.json.encodeToString(ModuleConfigSnapshot.serializer(), safe)
         }.getOrElse { "{}" }
 
         companion object {
@@ -144,6 +169,11 @@ internal class ModuleConfig(private val module: XposedModule) {
                 overlayDefaultY = model.overlayDefaultY,
                 overlayWidthDp = model.overlayWidthDp,
                 overlayHeightDp = model.overlayHeightDp,
+                autoDeoptimize = model.autoDeoptimize,
+                agentBaseUrl = model.agentBaseUrl,
+                agentModel = model.agentModel,
+                agentApiKey = model.agentApiKey,
+                agentMaxRounds = model.agentMaxRounds,
                 panels = model.panels,
                 revision = model.revision,
                 raw = model,

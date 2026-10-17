@@ -1,7 +1,7 @@
 /*
  * RegTrail floating window front-end.
  *
- * Three rules govern this file:
+ * Four rules govern this file:
  *   1. It must never throw. It runs inside a third-party app's process, and an
  *      uncaught error would leave the user with a blank window and no clue.
  *      Every entry point is wrapped.
@@ -9,15 +9,51 @@
  *      opened for a preview, or the interface failed to attach) the UI degrades
  *      to a read-only shell instead of breaking.
  *   3. Native code owns everything that matters — the window size, the log ring,
- *      the script list. This file asks and renders; it never assumes a value and
- *      never keeps the only copy of one.
+ *      the script list, the memory search session. This file asks and renders; it
+ *      never assumes a value and never keeps the only copy of one.
+ *   4. A long action never blocks the bridge. `Native.post` is synchronous, so a
+ *      memory scan or a model turn is submitted as a *job* and polled; see
+ *      `callJob`. The one exception is the resize drag, which deliberately applies
+ *      its size locally first and only then tells native code.
  */
 (function () {
   'use strict';
 
   var Native = window.RegTrailNative || null;
 
-  /* ---- Bridge --------------------------------------------------------- */
+  /* ---- Tiny DOM helpers ------------------------------------------------- */
+
+  function byId(id) {
+    return document.getElementById(id);
+  }
+
+  /**
+   * Creates one element.
+   *
+   * `textContent`, never `innerHTML`: this file renders data that came from
+   * another process (class names, field values, memory contents). Building DOM
+   * from strings would turn a hostile host app's class name into script.
+   */
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function raf(fn) {
+    if (window.requestAnimationFrame) return window.requestAnimationFrame(fn);
+    return setTimeout(fn, 16);
+  }
+
+  function setBusy(ids, busy) {
+    for (var i = 0; i < ids.length; i++) {
+      var node = byId(ids[i]);
+      if (node) node.disabled = !!busy;
+    }
+  }
+
+  /* ---- Bridge ----------------------------------------------------------- */
 
   /** Sends one message through the native bridge; returns its raw reply or null. */
   function call(action, payload) {
@@ -47,6 +83,104 @@
     }
   }
 
+  /* ---- Long-running jobs ------------------------------------------------ */
+
+  /*
+   * A memory scan may read 64 MiB and an Agent turn may sit in a socket for a
+   * minute. Both must not be awaited inside one `Native.post` call: that call
+   * blocks the WebView's JavaBridge thread, so the page cannot repaint, cannot
+   * respond to a tap, and looks frozen.
+   *
+   * The protocol is in `OverlayController` / `InProcessJobs`:
+   *   post(action)            -> data with `pending:false` when it finished inline
+   *                           -> data with `pending:true, job:N` otherwise
+   *   post('jobPoll', {job:N})-> same shape, `progress` while it runs
+   *   post('jobCancel', {job:N})
+   */
+
+  var POLL_MS = 250;
+
+  /** In-flight jobs, keyed by the action that started them. */
+  var pendingJobs = {};
+
+  function callJob(action, payload, onDone, onProgress, timeoutMs) {
+    var deadline = Date.now() + (timeoutMs || 60000);
+
+    var res = request(action, payload);
+    if (!res) {
+      onDone({ ok: false, error: '原生接口不可用（预览模式）' });
+      return 0;
+    }
+    if (!res.ok) {
+      onDone(res);
+      return 0;
+    }
+
+    var data = res.data || {};
+    if (!data.pending) {
+      onDone(res);
+      return 0;
+    }
+
+    var jobId = typeof data.job === 'number' ? data.job : 0;
+    if (!jobId) {
+      onDone({ ok: false, error: '原生返回了无效的任务编号' });
+      return 0;
+    }
+
+    pendingJobs[action] = { id: jobId, timer: 0 };
+    if (onProgress) onProgress(data);
+    schedulePoll(action, jobId, onDone, onProgress, deadline);
+    return jobId;
+  }
+
+  function schedulePoll(action, jobId, onDone, onProgress, deadline) {
+    var entry = pendingJobs[action];
+    if (!entry) return;
+
+    entry.timer = setTimeout(function () {
+      if (!pendingJobs[action]) return; // cancelled meanwhile
+
+      var res = request('jobPoll', { job: jobId });
+      if (!res) {
+        delete pendingJobs[action];
+        onDone({ ok: false, error: '原生接口不可用（预览模式）' });
+        return;
+      }
+      if (!res.ok) {
+        delete pendingJobs[action];
+        onDone(res);
+        return;
+      }
+
+      var data = res.data || {};
+      if (data.pending) {
+        if (onProgress) onProgress(data);
+        if (Date.now() > deadline) {
+          request('jobCancel', { job: jobId });
+          delete pendingJobs[action];
+          onDone({ ok: false, error: '任务超时（已请求取消）' });
+          return;
+        }
+        schedulePoll(action, jobId, onDone, onProgress, deadline);
+        return;
+      }
+
+      delete pendingJobs[action];
+      onDone(res);
+    }, POLL_MS);
+  }
+
+  /** Stops polling and asks native code to abandon the work. */
+  function cancelJob(action) {
+    var entry = pendingJobs[action];
+    if (!entry) return false;
+    if (entry.timer) clearTimeout(entry.timer);
+    request('jobCancel', { job: entry.id });
+    delete pendingJobs[action];
+    return true;
+  }
+
   /* ---- Theme ---------------------------------------------------------- */
 
   function applyConfig(cfg) {
@@ -72,14 +206,40 @@
       root.style.setProperty('--regtrail-corner', cfg.overlayCornerDp + 'px');
     }
 
-    // Panels list controls which tabs are offered.
-    if (Array.isArray(cfg.panels) && cfg.panels.length) {
-      var tabs = document.querySelectorAll('.tab');
-      for (var i = 0; i < tabs.length; i++) {
-        var name = tabs[i].getAttribute('data-tab');
-        tabs[i].style.display = cfg.panels.indexOf(name) >= 0 ? '' : 'none';
+    applyPanels(cfg);
+  }
+
+  /**
+   * Applies the published panel list.
+   *
+   * ## The compatibility rule
+   * A `config.json` published by a build that predates the 内存/Agent tabs names
+   * only `status`/`log`/`tools`. Honouring it would hide the two tabs this build
+   * adds, and a missing tab reads as "the feature was never integrated" — the
+   * exact complaint this version answers. Such a list is therefore treated as
+   * "no opinion" until the settings app republishes.
+   */
+  function applyPanels(cfg) {
+    var panels = [];
+    if (Object.prototype.toString.call(cfg.panels) === '[object Array]') {
+      for (var i = 0; i < cfg.panels.length; i++) {
+        if (typeof cfg.panels[i] === 'string') panels.push(cfg.panels[i]);
       }
     }
+    if (!panels.length) return;
+    if (panels.indexOf('mem') < 0 && panels.indexOf('agent') < 0) return;
+
+    var tabs = document.querySelectorAll('.tab');
+    var firstVisible = '';
+    for (var t = 0; t < tabs.length; t++) {
+      var name = tabs[t].getAttribute('data-tab');
+      var visible = panels.indexOf(name) >= 0;
+      tabs[t].style.display = visible ? '' : 'none';
+      if (visible && !firstVisible) firstVisible = name;
+    }
+    // The tab that was active may have just been hidden; leaving it active would
+    // make `currentTab()` lie and keep the log poller awake for nothing.
+    if (firstVisible && panels.indexOf(currentTab()) < 0) showTab(firstVisible);
   }
 
   /* Kotlin packs colours as a signed 32-bit ARGB int; JS sees it as a plain
@@ -105,9 +265,64 @@
   /** Mirrors the native collapsed state; gates the grip and the log poller. */
   var collapsed = false;
 
+  /**
+   * Resize limits, in dp, mirrored from `OverlaySizeLimits`.
+   *
+   * Kept as mutable state filled from native `status`/`resize` replies so the grip
+   * can clamp *while the finger moves*. The native clamp stays authoritative; a
+   * stale page can only be optimistic, never create an unreachable window.
+   */
+  var LIMITS = {
+    minW: 220,
+    minH: 200,
+    maxW: 0, // 0 = unknown, do not clamp
+    maxH: 0
+  };
+
+  function applyLimits(data) {
+    if (!data) return;
+    if (typeof data.minWidthDp === 'number' && data.minWidthDp > 0) {
+      LIMITS.minW = data.minWidthDp;
+    }
+    if (typeof data.minHeightDp === 'number' && data.minHeightDp > 0) {
+      LIMITS.minH = data.minHeightDp;
+    }
+
+    var maxW = typeof data.maxWidthDp === 'number' ? data.maxWidthDp : 0;
+    var maxH = typeof data.maxHeightDp === 'number' ? data.maxHeightDp : 0;
+    var fraction = typeof data.screenFraction === 'number' ? data.screenFraction : 0.9;
+    if (!maxW && typeof data.screenWidthDp === 'number') {
+      maxW = Math.floor(data.screenWidthDp * fraction);
+    }
+    if (!maxH && typeof data.screenHeightDp === 'number') {
+      maxH = Math.floor(data.screenHeightDp * fraction);
+    }
+    if (maxW > 0) LIMITS.maxW = maxW;
+    if (maxH > 0) LIMITS.maxH = maxH;
+  }
+
+  function clampWidthDp(value) {
+    var min = LIMITS.minW;
+    var max = LIMITS.maxW > 0 ? Math.max(min, LIMITS.maxW) : 0;
+    var rounded = Math.round(value);
+    if (rounded < min) return min;
+    if (max > 0 && rounded > max) return max;
+    return rounded;
+  }
+
+  function clampHeightDp(value) {
+    var min = LIMITS.minH;
+    var max = LIMITS.maxH > 0 ? Math.max(min, LIMITS.maxH) : 0;
+    var rounded = Math.round(value);
+    if (rounded < min) return min;
+    if (max > 0 && rounded > max) return max;
+    return rounded;
+  }
+
   function setStatus(data) {
     if (!data || !data.data) return;
     var d = data.data;
+    applyLimits(d);
     set('s-package', d.package);
     set('s-mechanism', mechanismLabel(d.mechanism));
     set('s-framework', d.framework);
@@ -149,9 +364,11 @@
   }
 
   function set(id, value) {
-    var el = document.getElementById(id);
-    if (el) el.textContent = (value === undefined || value === null || value === '')
-      ? '—' : String(value);
+    var node = byId(id);
+    if (node) {
+      node.textContent = (value === undefined || value === null || value === '')
+        ? '—' : String(value);
+    }
   }
 
   /**
@@ -159,10 +376,11 @@
    *
    * Measured from the panel itself rather than tracked: the native side resizes
    * the WebView, and CSS pixels inside it are dp (the viewport is at scale 1), so
-   * one measurement is both live and exact.
+   * one measurement is both live and exact. While a drag is overriding the panel's
+   * CSS size, this returns the override — which is what the drag maths wants.
    */
   function liveSizeDp() {
-    var panel = document.getElementById('panel');
+    var panel = byId('panel');
     if (!panel || typeof panel.getBoundingClientRect !== 'function') return null;
     var rect = panel.getBoundingClientRect();
     return { w: Math.round(rect.width), h: Math.round(rect.height) };
@@ -193,12 +411,10 @@
   var logSignature = '';
 
   function appendLog(line) {
-    var box = document.getElementById('log');
+    var box = byId('log');
     if (!box) return;
 
-    var div = document.createElement('div');
-    div.className = 'line ' + severityClass(line);
-    div.textContent = line;
+    var div = el('div', 'line ' + severityClass(line), line);
     box.appendChild(div);
 
     while (box.childNodes.length > MAX_LINES) {
@@ -216,7 +432,7 @@
   }
 
   function renderLogs(lines, meta) {
-    var box = document.getElementById('log');
+    var box = byId('log');
     if (!box) return;
 
     var view = box.parentNode;
@@ -227,10 +443,7 @@
 
     while (box.firstChild) box.removeChild(box.firstChild);
     for (var i = 0; i < lines.length; i++) {
-      var div = document.createElement('div');
-      div.className = 'line ' + severityClass(lines[i]);
-      div.textContent = lines[i];
-      box.appendChild(div);
+      box.appendChild(el('div', 'line ' + severityClass(lines[i]), lines[i]));
     }
 
     if (view && atBottom) view.scrollTop = view.scrollHeight;
@@ -238,7 +451,7 @@
   }
 
   function updateLogHint(meta, shown) {
-    var hint = document.getElementById('log-hint');
+    var hint = byId('log-hint');
     if (!hint) return;
     if (!Native) {
       hint.textContent = '原生接口不可用（预览模式）';
@@ -302,6 +515,13 @@
       views[j].classList.toggle('active', views[j].getAttribute('data-view') === name);
     }
     if (name === 'log') startLogPolling(); else stopLogPolling();
+    // Only 内存 and Agent have text fields; every other tab releases window focus
+    // so the soft keyboard cannot linger over a read-only page.
+    if (name !== 'mem' && name !== 'agent') setImeFocus(false);
+    // Cheap, non-blocking refreshes of the per-tab header lines. The heavy data
+    // (a scan, a model turn) is always an explicit button press.
+    if (name === 'mem') refreshMemoryState();
+    if (name === 'agent') refreshAgentState();
   }
 
   function currentTab() {
@@ -329,8 +549,8 @@
   }
 
   function on(id, fn) {
-    var el = document.getElementById(id);
-    if (el) el.addEventListener('click', fn);
+    var node = byId(id);
+    if (node) node.addEventListener('click', fn);
   }
 
   function refreshStatus() {
@@ -349,12 +569,13 @@
     setToolsStatus('配置已重载' +
       (targets === null ? '' : ' · ' + targets + ' 个悬浮窗目标'));
     refreshStatus();
+    refreshAgentState();
   }
 
   function clearLogs(message) {
     var res = request('clearLogs');
     logSignature = '';
-    var box = document.getElementById('log');
+    var box = byId('log');
     if (box) box.innerHTML = '';
     if (!res) { setToolsStatus('原生接口不可用（预览模式）', true); return; }
     if (!res.ok) { setToolsStatus(res.error || '清空失败', true); return; }
@@ -364,16 +585,16 @@
   }
 
   function copyLog() {
-    var box = document.getElementById('log');
+    var box = byId('log');
     if (!box) return;
     var text = box.innerText || '';
     try {
-      var ta = document.createElement('textarea');
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
+      var area = document.createElement('textarea');
+      area.value = text;
+      document.body.appendChild(area);
+      area.select();
       document.execCommand('copy');
-      document.body.removeChild(ta);
+      document.body.removeChild(area);
       setToolsStatus('已复制 ' + box.childNodes.length + ' 行日志');
     } catch (e) {
       // Clipboard access is best-effort inside a WebView without user activation.
@@ -395,15 +616,13 @@
   }
 
   function renderScripts(scripts) {
-    var box = document.getElementById('scripts');
+    var box = byId('scripts');
     if (!box) return;
     while (box.firstChild) box.removeChild(box.firstChild);
 
     if (!scripts.length) {
-      var empty = document.createElement('p');
-      empty.className = 'script empty';
-      empty.textContent = '没有启用的脚本：在 RegTrail 的脚本页启用后会出现在这里。';
-      box.appendChild(empty);
+      box.appendChild(el('p', 'script empty',
+        '没有启用的脚本：在 RegTrail 的脚本页启用后会出现在这里。'));
       return;
     }
 
@@ -413,22 +632,13 @@
   }
 
   function scriptRow(script) {
-    var row = document.createElement('div');
-    row.className = 'script';
+    var row = el('div', 'script');
 
-    var name = document.createElement('span');
-    name.className = 'name';
-    name.textContent = script.name || script.id;
+    var name = el('span', 'name', script.name || script.id);
+    name.appendChild(el('span', 'meta', triggerLabel(script.trigger) + ' · ' +
+      (typeof script.actions === 'number' ? script.actions : 0) + ' 个动作'));
 
-    var meta = document.createElement('span');
-    meta.className = 'meta';
-    meta.textContent = triggerLabel(script.trigger) + ' · ' +
-      (typeof script.actions === 'number' ? script.actions : 0) + ' 个动作';
-    name.appendChild(meta);
-
-    var run = document.createElement('button');
-    run.className = 'run';
-    run.textContent = '运行';
+    var run = el('button', 'run', '运行');
     run.addEventListener('click', function () { runScript(script, run); });
 
     row.appendChild(name);
@@ -480,21 +690,76 @@
   }
 
   function setToolsStatus(text, isError) {
-    var el = document.getElementById('tools-status');
-    if (!el) return;
-    el.textContent = text || '';
-    el.classList.toggle('error', !!isError);
+    setLine('tools-status', text, isError);
+  }
+
+  function setLine(id, text, isError) {
+    var node = byId(id);
+    if (!node) return;
+    node.textContent = text || '';
+    node.classList.toggle('error', !!isError);
+  }
+
+  /* ---- Text input focus (soft keyboard) -------------------------------- */
+
+  /*
+   * A `FLAG_NOT_FOCUSABLE` overlay cannot take input focus, and the soft keyboard
+   * attaches to the *focused window*: without this, every `<input>` in the panel
+   * would show a caret and never raise a keyboard.
+   *
+   * Native code lifts `FLAG_NOT_FOCUSABLE` while a field is being edited and
+   * restores it afterwards (and on BACK), so the panel keeps out of the host app's
+   * way the rest of the time.
+   */
+
+  var imeFocusable = false;
+
+  function setImeFocus(on) {
+    if (imeFocusable === !!on) return;
+    imeFocusable = !!on;
+    request('imeFocus', { focused: imeFocusable });
+  }
+
+  function bindTextFocus(node) {
+    if (!node || !node.addEventListener) return;
+
+    var acquire = function () { setImeFocus(true); };
+    node.addEventListener('focus', acquire);
+    // `pointerdown` arrives *before* the browser focuses the field, which is the
+    // only ordering that lets the keyboard appear on the very first tap.
+    node.addEventListener('pointerdown', acquire);
+    if (!HAS_POINTER) node.addEventListener('touchstart', acquire);
+
+    node.addEventListener('blur', function () {
+      // A tap on another field fires blur and then focus; releasing focusability
+      // in between would drop the IME that is about to appear.
+      setTimeout(function () {
+        if (document.activeElement !== node) setImeFocus(false);
+      }, 150);
+    });
   }
 
   /* ---- Resize grip ---------------------------------------------------- */
 
   /*
-   * Mirror of `OverlaySizeLimits` on the native side. They are duplicated because
-   * they live in different languages; the native clamp is authoritative, so a
-   * mismatch can only make the page optimistic, never produce an unusable window.
+   * The grip drives the window size in two directions at once:
+   *
+   *   1. **Locally, immediately.** The pointer delta is written straight into
+   *      `#panel`'s CSS width/height, so the panel tracks the finger at the
+   *      display's own refresh rate with no bridge call in the loop.
+   *   2. **Natively, at most once per animation frame.** Only the latest size is
+   *      sent, so a 120 Hz touch stream cannot flood the synchronous JNI bridge,
+   *      and the size is persisted only on release (`final: true`).
+   *
+   * Before this, every pointer move waited for a synchronous `Native.post` whose
+   * reply only arrived after `WindowManager.updateViewLayout` had run on the main
+   * thread: one to three frames of lag behind the finger, which is exactly what
+   * "大小调整操作手感反人类" describes.
+   *
+   * The clamp mirrors the native limits (min 220x200 dp, max 90 % of the screen)
+   * so the drag hits a wall instead of fighting the native clamp with a value the
+   * window will never take.
    */
-  var MIN_WIDTH_DP = 220;
-  var MIN_HEIGHT_DP = 200;
 
   /* Pointer Events cover both fingers and mice and are universally available in
      Android's WebView since Chrome 55. Touch events are the fallback so the grip
@@ -505,8 +770,46 @@
   var EV_UP = HAS_POINTER ? 'pointerup' : 'touchend';
   var EV_CANCEL = HAS_POINTER ? 'pointercancel' : 'touchcancel';
 
+  /** Non-null while the page is overriding `#panel`'s CSS size during a drag. */
+  var localSize = null;
+
+  function applyLocalSize(widthDp, heightDp) {
+    var panel = byId('panel');
+    if (!panel) return;
+    panel.style.width = widthDp + 'px';
+    panel.style.height = heightDp + 'px';
+    localSize = { w: widthDp, h: heightDp };
+  }
+
+  function clearLocalSize() {
+    var panel = byId('panel');
+    if (panel) {
+      panel.style.width = '';
+      panel.style.height = '';
+    }
+    localSize = null;
+  }
+
+  /**
+   * Drops the local override once the WebView itself has caught up.
+   *
+   * The native window resize arrives asynchronously (`main.post` →
+   * `updateViewLayout`), and the WebView's viewport follows it. Removing the
+   * inline size before that makes the panel snap back to the *old* viewport for a
+   * frame; removing it after is invisible. Comparing the viewport to the override
+   * is the cheapest way to know.
+   */
+  function syncLocalSize() {
+    if (!localSize) return;
+    var w = window.innerWidth;
+    var h = window.innerHeight;
+    if (Math.abs(w - localSize.w) <= 2 && Math.abs(h - localSize.h) <= 2) {
+      clearLocalSize();
+    }
+  }
+
   function initGrip() {
-    var grip = document.getElementById('grip');
+    var grip = byId('grip');
     if (!grip) return;
 
     var active = false;
@@ -514,8 +817,10 @@
     var startY = 0;
     var startW = 0;
     var startH = 0;
-    var pending = null;
+    var latest = null;
     var frame = 0;
+    var sentW = 0;
+    var sentH = 0;
 
     /*
      * Touch events carry the interesting coordinate in `touches` while moving and
@@ -530,9 +835,10 @@
 
     function compute(ev) {
       var p = point(ev, ev.type === EV_UP || ev.type === EV_CANCEL);
+      if (!p || typeof p.clientX !== 'number' || typeof p.clientY !== 'number') return null;
       return {
-        w: Math.max(MIN_WIDTH_DP, Math.round(startW + (p.clientX - startX))),
-        h: Math.max(MIN_HEIGHT_DP, Math.round(startH + (p.clientY - startY)))
+        w: clampWidthDp(startW + (p.clientX - startX)),
+        h: clampHeightDp(startH + (p.clientY - startY))
       };
     }
 
@@ -549,8 +855,18 @@
       startY = p.clientY;
       startW = size.w;
       startH = size.h;
+      sentW = size.w;
+      sentH = size.h;
+      latest = { w: size.w, h: size.h };
+
+      // No text selection, no scroll gesture, no long-press callout while the
+      // finger is on the handle.
       document.body.classList.add('dragging');
+
       if (HAS_POINTER && grip.setPointerCapture) {
+        // Pointer capture is what keeps the move stream coming when the finger
+        // leaves the 30 dp handle — without it the drag stops as soon as the
+        // finger outruns the corner.
         try { grip.setPointerCapture(ev.pointerId); } catch (e) { /* not fatal */ }
       }
       if (ev.cancelable) ev.preventDefault();
@@ -560,15 +876,22 @@
       if (!active) return;
       if (ev.cancelable) ev.preventDefault();
 
-      pending = compute(ev);
-      // One bridge call per animation frame: `post` is a synchronous JNI call, so
-      // every raw touch sample would be both wasteful and janky.
+      var size = compute(ev);
+      if (!size) return;
+      latest = size;
+
+      // 1) the panel follows the finger right now
+      applyLocalSize(size.w, size.h);
+
+      // 2) native code hears about it once per frame, at most
       if (frame) return;
-      frame = requestAnimationFrame(function () {
+      frame = raf(function () {
         frame = 0;
-        var size = pending;
-        pending = null;
-        if (size && active) sendResize(size.w, size.h, false);
+        if (!active || !latest) return;
+        if (latest.w === sentW && latest.h === sentH) return;
+        sentW = latest.w;
+        sentH = latest.h;
+        sendResize(latest.w, latest.h, false);
       });
     }
 
@@ -578,19 +901,36 @@
       document.body.classList.remove('dragging');
       if (frame && window.cancelAnimationFrame) window.cancelAnimationFrame(frame);
       frame = 0;
-      pending = null;
+      if (HAS_POINTER && grip.releasePointerCapture && ev && ev.pointerId !== undefined) {
+        try { grip.releasePointerCapture(ev.pointerId); } catch (e) { /* not fatal */ }
+      }
 
-      var size = compute(ev);
+      var size = compute(ev) || latest;
+      latest = null;
+      if (!size) return;
+      applyLocalSize(size.w, size.h);
       // `final: true` is what makes native code persist the size; intermediate
       // frames only resize the window so a drag does not write preferences on
       // every animation frame.
       sendResize(size.w, size.h, true);
     }
 
+    /** A lost capture (finger off the screen, window change) ends the drag. */
+    function lost(ev) {
+      if (!active) return;
+      end(ev);
+    }
+
     grip.addEventListener(EV_DOWN, begin, false);
     window.addEventListener(EV_MOVE, move, { passive: false });
     window.addEventListener(EV_UP, end, false);
     window.addEventListener(EV_CANCEL, end, false);
+    if (HAS_POINTER) {
+      grip.addEventListener('lostpointercapture', lost, false);
+      // `pointerup` outside the window (a finger that leaves the WebView) still
+      // ends the drag through the capture callback above; this is the belt.
+      grip.addEventListener('pointerup', end, false);
+    }
   }
 
   function sendResize(widthDp, heightDp, isFinal) {
@@ -604,11 +944,18 @@
       if (res.error) setToolsStatus(res.error, true);
       return res;
     }
-    if (res.data && typeof res.data.widthDp === 'number' &&
-        typeof res.data.heightDp === 'number') {
-      // Adopt the clamped size so the next drag starts from reality, not from a
-      // value the native side refused.
-      lastNativeSize = { w: res.data.widthDp, h: res.data.heightDp };
+
+    var data = res.data || {};
+    applyLimits(data);
+    if (typeof data.widthDp === 'number' && typeof data.heightDp === 'number') {
+      lastNativeSize = { w: data.widthDp, h: data.heightDp };
+      // The native clamp is authoritative: if it disagreed with what the page just
+      // drew (a rotation mid-drag, a stale screen-size guess), show the size the
+      // window really became instead of leaving the finger and the frame
+      // disagreeing.
+      if (data.widthDp !== widthDp || data.heightDp !== heightDp) {
+        applyLocalSize(data.widthDp, data.heightDp);
+      }
       renderSize();
     }
     return res;
@@ -621,10 +968,610 @@
     document.body.classList.toggle('collapsed', collapsed);
     if (collapsed) {
       stopLogPolling();
+      clearLocalSize();
+      // A 112 dp pill has no text fields: it must not hold the keyboard.
+      setImeFocus(false);
     } else if (currentTab() === 'log') {
       startLogPolling();
     }
     renderSize();
+  }
+
+  /* ---- Memory tab ----------------------------------------------------- */
+
+  /*
+   * A search session lives on the native side (see `MemorySessions`): 首次扫描
+   * starts one, 再次扫描 filters it. The page only ever holds the *rendered* rows,
+   * so a WebView reload cannot lose the candidate addresses.
+   *
+   * Rendering is capped and chunked: a scan may legitimately return 500 hits, and
+   * piping all of them into the DOM at once inside a 300 dp window both freezes the
+   * panel for a frame and produces a list nobody reads.
+   */
+  var MEM_MAX_RENDERED = 200;
+  var MEM_CHUNK = 80;
+  var MEM_TIMEOUT_MS = 90000;
+
+  var memSession = 0;
+  var memRenderToken = 0;
+  var memModified = 0;
+  /**
+   * The type the current session was started with.
+   *
+   * Remembered here as well as echoed by native: a resulting row is edited later
+   * (possibly after a `memSessions` refresh that no longer carries the type), and
+   * writing with the wrong width would corrupt two neighbouring values instead of
+   * one. Falls back to the selector, then to `int32`.
+   */
+  var memType = 'int32';
+
+  function initMemory() {
+    on('btn-mem-scan', function () { runMemoryScan(true); });
+    on('btn-mem-refine', function () { runMemoryScan(false); });
+    on('btn-mem-revert-all', revertAllMemory);
+    on('btn-mem-clear', clearMemorySession);
+
+    var value = byId('mem-value');
+    if (value) {
+      bindTextFocus(value);
+      value.addEventListener('keydown', function (ev) {
+        // Enter = 首次扫描: searching a value then reaching for the button is the
+        // one interaction that repeats hundreds of times per investigation.
+        if (ev.key === 'Enter') { ev.preventDefault(); runMemoryScan(true); }
+      });
+    }
+    refreshMemoryState();
+  }
+
+  /** Drops the search sessions; native keeps the recorded originals for 还原. */
+  function clearMemorySession() {
+    var res = request('memClear');
+    if (!res) { setLine('mem-status', '原生接口不可用（预览模式）', true); return; }
+    if (!res.ok) { setLine('mem-status', res.error || '清空失败', true); return; }
+
+    memSession = 0;
+    memRenderToken++;
+    var box = byId('mem-results');
+    if (box) {
+      while (box.firstChild) box.removeChild(box.firstChild);
+    }
+    var note = byId('mem-note');
+    if (note) note.textContent = '';
+    setLine('mem-status', '已清空搜索会话（已记录的原始值仍可用「还原」恢复）');
+    refreshMemoryState();
+  }
+
+  function runMemoryScan(isFirst) {
+    var typeNode = byId('mem-type');
+    var valueNode = byId('mem-value');
+    // A `<select>` with nothing selected reports '', which native code would
+    // reject as an unknown type. Defaulting here keeps a stripped-down WebView
+    // from turning a scan into a confusing error.
+    var type = typeNode && typeNode.value ? typeNode.value : 'int32';
+    var value = valueNode ? (valueNode.value || '').trim() : '';
+
+    // One scan at a time. The Enter key path bypasses the disabled buttons, and a
+    // second 64 MiB scan on top of a running one would just halve both.
+    var running = isFirst ? 'memScan' : 'memRefine';
+    if (pendingJobs[running]) {
+      setLine('mem-status', '上一次扫描还在进行，可以先「停止」或等它结束', true);
+      return;
+    }
+
+    if (!value) {
+      setLine('mem-status', '请输入要搜索的值', true);
+      if (valueNode) valueNode.focus();
+      return;
+    }
+    if (!isFirst && !memSession) {
+      setLine('mem-status', '请先做一次「首次扫描」', true);
+      return;
+    }
+
+    var writableNode = byId('mem-writable');
+    var writable = !!(writableNode && writableNode.checked);
+    var action = isFirst ? 'memScan' : 'memRefine';
+    var payload = isFirst
+      ? { type: type, value: value, writableOnly: writable }
+      : { session: memSession, value: value, type: type };
+
+    setLine('mem-status', isFirst
+      ? '正在扫描本进程内存（' + type + ' = ' + value + '）…'
+      : '正在复核会话 #' + memSession + '（' + type + ' = ' + value + '）…');
+    setBusy(['btn-mem-scan', 'btn-mem-refine'], true);
+    memType = type;
+
+    callJob(action, payload, function (res) {
+      setBusy(['btn-mem-scan', 'btn-mem-refine'], false);
+      if (!res) {
+        setLine('mem-status', '原生接口不可用（预览模式）', true);
+        return;
+      }
+      if (!res.ok) {
+        setLine('mem-status', res.error || '扫描失败', true);
+        return;
+      }
+      var data = res.data || {};
+      if (typeof data.session === 'number' && data.session > 0) memSession = data.session;
+      renderMemoryResults(data);
+      refreshMemoryState();
+    }, function (data) {
+      if (data && data.progress) setLine('mem-status', data.progress);
+    }, MEM_TIMEOUT_MS);
+  }
+
+  function renderMemoryResults(data) {
+    var box = byId('mem-results');
+    if (!box) return;
+
+    var results = Object.prototype.toString.call(data.results) === '[object Array]'
+      ? data.results : [];
+    var total = typeof data.count === 'number' ? data.count : results.length;
+    if (typeof data.type === 'string' && data.type) memType = data.type;
+    var token = ++memRenderToken;
+
+    while (box.firstChild) box.removeChild(box.firstChild);
+
+    if (!results.length) {
+      box.appendChild(el('p', 'hint',
+        '没有命中。数值类型要区分正负与小数写法；字符串区分大小写，' +
+        '而且 utf8 搜索不会命中 UTF-16 常量池里的字符串。'));
+    }
+
+    var limit = Math.min(results.length, MEM_MAX_RENDERED);
+    var index = 0;
+
+    function chunk() {
+      // A newer scan started: this render is stale, stop touching the DOM.
+      if (token !== memRenderToken) return;
+      var end = Math.min(index + MEM_CHUNK, limit);
+      for (; index < end; index++) {
+        box.appendChild(memoryRow(results[index], data));
+      }
+      if (index < limit) raf(chunk);
+    }
+    chunk();
+
+    if (total > limit) {
+      box.appendChild(el('p', 'hint',
+        '共 ' + total + ' 条，仅渲染前 ' + limit + ' 条（地址升序）。' +
+        '用「再次扫描」缩小范围比逐条翻更有效。'));
+    }
+
+    var note = byId('mem-note');
+    if (note) {
+      note.textContent = (data.note || '') +
+        (data.truncated ? '　（结果已截断）' : '');
+    }
+    setLine('mem-status', '命中 ' + total + ' 条' +
+      (typeof data.bytesRead === 'number' ? ' · 读取 ' + mibText(data.bytesRead) : ''));
+  }
+
+  function mibText(bytes) {
+    if (typeof bytes !== 'number' || bytes <= 0) return '0 KiB';
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KiB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
+  }
+
+  function memoryRow(match, scanData) {
+    var row = el('div', 'mem-row');
+    row.appendChild(el('span', 'addr', match && match.addr ? match.addr : '?'));
+    var valueSpan = el('span', 'val',
+      match && match.value !== undefined ? match.value : '?');
+    row.appendChild(valueSpan);
+
+    // The type is fixed by the session, not by the row: native echoes it on a
+    // scan reply, and `memType` covers a row rendered from a reply that did not.
+    var kind = (scanData && scanData.type) || memType;
+
+    var edit = el('button', 'mini', '改');
+    edit.addEventListener('click', function () {
+      toggleMemoryEditor(row, match, kind, valueSpan);
+    });
+    row.appendChild(edit);
+    return row;
+  }
+
+  function toggleMemoryEditor(row, match, kind, valueSpan) {
+    // Only one editor at a time: several open editors in a 200-row list is a
+    // scroll-position minefield.
+    var existing = document.querySelectorAll('.mem-edit');
+    var mine = row.nextSibling && row.nextSibling.className === 'mem-edit'
+      ? row.nextSibling : null;
+    for (var i = 0; i < existing.length; i++) {
+      if (existing[i] !== mine && existing[i].parentNode) {
+        existing[i].parentNode.removeChild(existing[i]);
+      }
+    }
+    if (mine) {
+      row.parentNode.removeChild(mine);
+      return;
+    }
+
+    var box = el('div', 'mem-edit');
+    var input = document.createElement('input');
+    input.className = 'input';
+    input.type = 'text';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.value = match && match.value !== undefined ? String(match.value) : '';
+    box.appendChild(input);
+
+    var actions = el('div', 'row');
+    actions.style.margin = '0';
+    actions.style.flex = '1 1 100%';
+
+    var writeBtn = el('button', 'mini danger', '写入');
+    var revertBtn = el('button', 'mini', '还原');
+    actions.appendChild(writeBtn);
+    actions.appendChild(revertBtn);
+    box.appendChild(actions);
+
+    writeBtn.addEventListener('click', function () {
+      confirmMemoryWrite(box, match, input, kind, valueSpan);
+    });
+    revertBtn.addEventListener('click', function () {
+      // 还原 does not need a value: it restores the bytes the first write
+      // replaced, which native code remembered.
+      writeMemory(match.addr, kind, null, 'revert', match, valueSpan);
+      row.parentNode.removeChild(box);
+    });
+
+    row.parentNode.insertBefore(box, row.nextSibling);
+    try { input.focus(); } catch (e) { /* keyboard is best-effort */ }
+  }
+
+  /**
+   * The mandatory confirmation step before a memory write.
+   *
+   * A write into the host app can corrupt its state with no undo other than
+   * 「还原」, and the addresses come from a fuzzy search. The product plan requires
+   * an explicit user confirmation for exactly this reason, so the first tap only
+   * *arms* the write: the address and value are repeated back, and the confirming
+   * button is styled as dangerous and is a different target from the one the user
+   * just pressed.
+   */
+  function confirmMemoryWrite(box, match, input, kind, valueSpan) {
+    var value = (input.value || '').trim();
+    if (!value) {
+      setLine('mem-status', '请输入要写入的值', true);
+      return;
+    }
+
+    while (box.firstChild) box.removeChild(box.firstChild);
+
+    var bar = el('div', 'mem-confirm');
+    bar.appendChild(el('span', 'text',
+      '确认写入 ' + match.addr + ' = ' + value + '（' + kind + '）？' +
+      '这会立即改变目标应用的运行状态，写入前会记录原始值，「还原」可以恢复。'));
+
+    var confirm = el('button', 'mini danger', '确认写入');
+    var cancel = el('button', 'mini', '取消');
+    confirm.addEventListener('click', function () {
+      setLine('mem-status', '正在写入 ' + match.addr + ' …');
+      writeMemory(match.addr, kind, value, 'write', match, valueSpan);
+      if (box.parentNode) box.parentNode.removeChild(box);
+    });
+    cancel.addEventListener('click', function () {
+      if (box.parentNode) box.parentNode.removeChild(box);
+      setLine('mem-status', '已取消写入');
+    });
+
+    bar.appendChild(confirm);
+    bar.appendChild(cancel);
+    box.appendChild(bar);
+  }
+
+  function writeMemory(addr, type, value, mode, match, valueSpan) {
+    var res = mode === 'revert'
+      ? request('memRevert', { addr: addr })
+      : request('memWrite', { addr: addr, type: type, value: value });
+
+    if (!res) {
+      setLine('mem-status', '原生接口不可用（预览模式）', true);
+      return;
+    }
+    if (!res.ok) {
+      setLine('mem-status', res.error || (mode === 'revert' ? '还原失败' : '写入失败'), true);
+      return;
+    }
+
+    var data = res.data || {};
+    if (mode === 'revert') {
+      setLine('mem-status', '已还原 ' + (data.addr || addr) +
+        '（剩余修改 ' + (typeof data.modifiedCount === 'number' ? data.modifiedCount : 0) + ' 处）');
+      if (valueSpan && typeof data.value === 'string') valueSpan.textContent = data.value;
+      if (match && typeof data.value === 'string') match.value = data.value;
+    } else {
+      setLine('mem-status', '已写入 ' + (data.addr || addr) + ' = ' + (data.value || value) +
+        (data.verified === false ? '（回读不一致！）' : '（回读一致）'));
+      if (valueSpan) valueSpan.textContent = data.value || value;
+      if (match) match.value = data.value || value;
+    }
+    refreshMemoryState();
+  }
+
+  /**
+   * Reverts every modified address, behind an explicit two-step confirmation.
+   *
+   * ## Why not `window.confirm`
+   * The injected WebView has no `WebChromeClient`, so the built-in dialog has
+   * nothing to draw it: `confirm()` returns false immediately and the button
+   * silently does nothing. Every confirmation in this panel is therefore in-page.
+   *
+   * The disarm timer matters as much as the confirmation: the button sits at the
+   * bottom of a list the user may be scrolling, and a stray second tap minutes
+   * later must not rewrite the host app's memory.
+   */
+  function revertAllMemory() {
+    var button = byId('btn-mem-revert-all');
+    if (!button) return;
+
+    if (memModified <= 0) {
+      setLine('mem-status', '没有被修改过的地址');
+      return;
+    }
+
+    if (button.getAttribute('data-confirm') === '1') {
+      button.removeAttribute('data-confirm');
+      sendRevertAll();
+      return;
+    }
+
+    button.setAttribute('data-confirm', '1');
+    button.textContent = '确认还原 ' + memModified + ' 处（再点一次）';
+    setLine('mem-status',
+      '再点一次才会把 ' + memModified + ' 个地址改回写入前的原始值（6 秒后自动取消）');
+    setTimeout(function () {
+      if (button.getAttribute('data-confirm') !== '1') return;
+      button.removeAttribute('data-confirm');
+      button.textContent = '还原全部修改（' + memModified + '）';
+    }, 6000);
+  }
+
+  function sendRevertAll() {
+    var res = request('memRevert', { addr: 'all' });
+    if (!res) { setLine('mem-status', '原生接口不可用（预览模式）', true); return; }
+    if (!res.ok) { setLine('mem-status', res.error || '还原失败', true); return; }
+
+    var count = res.data && typeof res.data.reverted === 'number' ? res.data.reverted : 0;
+    setLine('mem-status', '已还原 ' + count + ' 处修改');
+
+    // Every rendered value is now stale, and native code cannot hand back the new
+    // ones cheaply (a revert rewrites memory the sessions only cached values for).
+    // Saying so is more honest than printing numbers that may be wrong.
+    memRenderToken++;
+    var box = byId('mem-results');
+    if (box) {
+      while (box.firstChild) box.removeChild(box.firstChild);
+      box.appendChild(el('p', 'hint', '已还原全部修改：列表里的值可能已经变化，请重新扫描。'));
+    }
+    refreshMemoryState();
+  }
+
+  /** Refreshes the modified-count badge and the 「还原全部」 button state. */
+  function refreshMemoryState() {
+    var res = request('memSessions');
+    if (!res || !res.ok || !res.data) return;
+    var data = res.data;
+    memModified = typeof data.modifiedCount === 'number' ? data.modifiedCount : 0;
+
+    var button = byId('btn-mem-revert-all');
+    if (button) {
+      if (button.getAttribute('data-confirm') !== '1') {
+        button.textContent = '还原全部修改（' + memModified + '）';
+      }
+      button.disabled = memModified <= 0;
+    }
+  }
+
+  /* ---- Agent tab ------------------------------------------------------ */
+
+  /*
+   * Two entry points, and the UI says which one is live:
+   *
+   *  - the chat box runs a real ReAct loop **inside this process** against an
+   *    OpenAI-compatible endpoint, using the same tools the console exposes
+   *    (`InProcessAgent`, native side);
+   *  - the console calls one tool with hand-written JSON. It works even when no
+   *    model is configured or the host app has no INTERNET permission, which is
+   *    the honest fallback rather than a dead chat box.
+   */
+  var AGENT_MAX_LINES = 120;
+  var AGENT_TIMEOUT_MS = 300000;
+
+  function initAgent() {
+    on('btn-agent-send', sendAgentTurn);
+    on('btn-agent-reset', resetAgentConversation);
+    on('btn-agent-stop', function () {
+      if (cancelJob('agentChat')) {
+        setLine('agent-status', '已请求停止（模型请求可能仍会返回，结果会被丢弃）');
+      } else {
+        setLine('agent-status', '当前没有正在运行的对话');
+      }
+    });
+    on('btn-console-run', runConsoleTool);
+
+    var input = byId('agent-input');
+    if (input) {
+      bindTextFocus(input);
+      input.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') { ev.preventDefault(); sendAgentTurn(); }
+      });
+    }
+    var consoleInput = byId('console-input');
+    if (consoleInput) {
+      bindTextFocus(consoleInput);
+      consoleInput.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') { ev.preventDefault(); runConsoleTool(); }
+      });
+    }
+    refreshAgentState();
+  }
+
+  function refreshAgentState() {
+    var hint = byId('agent-state');
+    var res = request('agentState');
+    if (!res || !res.ok || !res.data) {
+      if (hint) {
+        hint.textContent = '原生接口不可用（预览模式）：只能查看，不能调用工具。';
+        hint.classList.add('error');
+      }
+      return;
+    }
+
+    var data = res.data;
+    var parts = [];
+    if (!data.configured) {
+      parts.push('Agent 未配置：在设置端填写 Base URL / 模型 / API Key 后点「重载配置」；' +
+        '下面的工具控制台现在就能用');
+    } else {
+      parts.push('模型 ' + (data.model || '?') + ' · ' + (data.baseUrl || '?'));
+      parts.push('工具 ' + ((data.tools || []).length) + ' 个');
+      if (typeof data.messages === 'number') parts.push('对话 ' + data.messages + ' 条消息');
+      if (!data.internet) {
+        parts.push('目标应用没有 INTERNET 权限，对话不可用');
+      }
+    }
+    if (hint) {
+      hint.textContent = parts.join(' · ');
+      hint.classList.toggle('error', !data.configured || !data.internet);
+    }
+  }
+
+  function sendAgentTurn() {
+    var input = byId('agent-input');
+    if (!input) return;
+    var text = (input.value || '').trim();
+    if (!text) {
+      setLine('agent-status', '请输入要问 Agent 的内容', true);
+      return;
+    }
+    // The Enter key path bypasses the disabled button; a second turn queued on the
+    // same conversation would interleave two histories.
+    if (pendingJobs['agentChat']) {
+      setLine('agent-status', '上一轮还在进行；可以「停止」或等它结束', true);
+      return;
+    }
+
+    var destructiveNode = byId('agent-destructive');
+    var allowDestructive = !!(destructiveNode && destructiveNode.checked);
+
+    appendAgentMessage('user', text);
+    input.value = '';
+    setLine('agent-status', 'Agent 正在思考…');
+    setBusy(['btn-agent-send'], true);
+
+    callJob('agentChat', {
+      message: text,
+      allowDestructive: allowDestructive
+    }, function (res) {
+      setBusy(['btn-agent-send'], false);
+      if (!res) {
+        appendAgentMessage('error', '原生接口不可用（预览模式）');
+        setLine('agent-status', '未连接', true);
+        return;
+      }
+      if (!res.ok) {
+        appendAgentMessage('error', res.error || 'Agent 调用失败');
+        setLine('agent-status', res.error || '调用失败', true);
+        return;
+      }
+
+      var data = res.data || {};
+      if (Object.prototype.toString.call(data.steps) === '[object Array]' &&
+          data.steps.length) {
+        appendAgentMessage('tool', data.steps.join('\n'));
+      }
+      appendAgentMessage('assistant', data.reply || '（空回复）');
+      setLine('agent-status', '完成' +
+        (data.allowDestructive ? '（本次允许破坏性操作）' : ''));
+      refreshAgentState();
+    }, function (data) {
+      if (data && data.progress) setLine('agent-status', data.progress);
+    }, AGENT_TIMEOUT_MS);
+  }
+
+  function appendAgentMessage(role, text) {
+    var log = byId('agent-log');
+    if (!log) return;
+
+    log.appendChild(el('div', 'msg ' + role, text));
+    while (log.childNodes.length > AGENT_MAX_LINES) {
+      log.removeChild(log.firstChild);
+    }
+
+    var view = document.querySelector('.view[data-view="agent"]');
+    if (view) view.scrollTop = view.scrollHeight;
+  }
+
+  function resetAgentConversation() {
+    var res = request('agentReset');
+    var log = byId('agent-log');
+    if (log) {
+      while (log.firstChild) log.removeChild(log.firstChild);
+    }
+    if (!res) {
+      setLine('agent-status', '原生接口不可用（预览模式）', true);
+      return;
+    }
+    if (!res.ok) {
+      setLine('agent-status', res.error || '清空失败', true);
+      return;
+    }
+    setLine('agent-status', '对话已清空');
+    refreshAgentState();
+  }
+
+  /**
+   * Runs one tool from the console: `工具名 {json}`.
+   *
+   * The JSON is passed through untouched; a parse error is reported here rather
+   * than silently sending `{}`, because "why did list_classes ignore my pattern"
+   * is a wasted debugging round trip.
+   */
+  function runConsoleTool() {
+    var input = byId('console-input');
+    var out = byId('console-out');
+    if (!input || !out) return;
+
+    var text = (input.value || '').trim();
+    if (!text) return;
+
+    var space = text.indexOf(' ');
+    var name = space < 0 ? text : text.slice(0, space);
+    var rest = space < 0 ? '' : text.slice(space + 1).trim();
+
+    var args = {};
+    if (rest) {
+      try {
+        args = JSON.parse(rest);
+      } catch (e) {
+        out.textContent = '参数不是合法 JSON：' + e.message;
+        setLine('agent-status', '参数不是合法 JSON', true);
+        return;
+      }
+    }
+
+    setLine('agent-status', '正在执行 ' + name + ' …');
+    var res = request('agentTool', { name: name, args: args });
+
+    if (!res) {
+      out.textContent = '原生接口不可用（预览模式）';
+      setLine('agent-status', '未连接', true);
+      return;
+    }
+    if (!res.ok) {
+      out.textContent = res.error || '工具执行失败';
+      setLine('agent-status', res.error || '工具执行失败', true);
+      return;
+    }
+
+    var data = res.data || {};
+    out.textContent = data.text || '（空结果）';
+    setLine('agent-status',
+      name + ' ' + (data.toolOk ? '完成' : '失败') + ' · ' + (data.text || '').length + ' 字符',
+      !data.toolOk);
   }
 
   /* ---- Native -> page API --------------------------------------------- */
@@ -638,8 +1585,9 @@
     },
     onCollapsed: function (value) {
       // Native resizes the window to a pill and shows its own native pill view.
-      // Nothing here must reload the page: the tab, the scrolled log and the
-      // script list all have to survive a collapse/expand round trip.
+      // Nothing here must reload the page: the tab, the scrolled log, the script
+      // list, the memory results and the Agent conversation all have to survive a
+      // collapse/expand round trip.
       try { setCollapsedState(value); } catch (e) { /* ignore */ }
     }
   };
@@ -651,6 +1599,8 @@
       initTabs();
       initButtons();
       initGrip();
+      initMemory();
+      initAgent();
       request('ready');
       refreshStatus();
       renderSize();
@@ -659,9 +1609,12 @@
       setTimeout(refreshStatus, 400);
       // Native resizes the WebView itself (grip drag, config change, rotation),
       // which fires `resize` here — the cheapest way to keep the size readout
-      // live without polling.
+      // live, and the moment the local drag override can be dropped.
       window.addEventListener('resize', function () {
-        try { renderSize(); } catch (e) { /* ignore */ }
+        try {
+          syncLocalSize();
+          renderSize();
+        } catch (e) { /* ignore */ }
       });
     } catch (e) {
       // Last resort: show something rather than an empty panel.

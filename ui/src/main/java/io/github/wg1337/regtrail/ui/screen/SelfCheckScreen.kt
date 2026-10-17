@@ -2,7 +2,6 @@ package io.github.wg1337.regtrail.ui.screen
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -17,19 +16,20 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.Button
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import io.github.wg1337.regtrail.shared.model.CheckStatus
 import io.github.wg1337.regtrail.shared.model.SelfCheckReport
 import io.github.wg1337.regtrail.shared.model.ZygiskState
+import io.github.wg1337.regtrail.ui.screen.settings.SubPageHeader
 
 @Composable
 fun SelfCheckScreen(
     report: SelfCheckReport?,
     running: Boolean,
     onRerun: () -> Unit,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -39,22 +39,16 @@ fun SelfCheckScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("环境自检", style = MaterialTheme.typography.headlineSmall)
-                Text(
-                    "确认 RegTrail 运行所需的 Root 与 LSPosed 条件",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (running) {
-                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-            }
-        }
+        SubPageHeader(
+            title = "环境自检",
+            subtitle = "确认 RegTrail 运行所需的 Root 与 LSPosed 条件",
+            onBack = onBack,
+            trailing = {
+                if (running) {
+                    CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                }
+            },
+        )
 
         if (report == null) {
             Text(

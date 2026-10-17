@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,6 +34,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.wg1337.regtrail.shared.model.CheckStatus
 import io.github.wg1337.regtrail.ui.debug.DebugUiState
+import io.github.wg1337.regtrail.ui.screen.settings.SubPageHeader
+import io.github.wg1337.regtrail.ui.state.HookMode
 
 /**
  * The live debugger screen.
@@ -44,16 +45,24 @@ import io.github.wg1337.regtrail.ui.debug.DebugUiState
  * and never will be through this mechanism — that needs native instrumentation.
  * Saying so up front prevents the feature being judged against a promise it never
  * made.
+ *
+ * Reached from 设置 → 调试 (and from 总览's quick actions) rather than from a
+ * bottom-bar tab: it is a work surface, and the tab budget is now spent on the
+ * four destinations people navigate between. [defaultHookMode] is the value from
+ * 设置 → 调试 → Hook 默认行为 and only decides which of the two per-method actions
+ * is the one-tap primary button.
  */
 @Composable
 fun DebugScreen(
     state: DebugUiState,
+    defaultHookMode: HookMode,
     onRefresh: () -> Unit,
     onSearchClasses: (String) -> Unit,
     onSearchMethods: (String, String) -> Unit,
     onHookTrace: (String) -> Unit,
     onHookReturn: (String, String, String) -> Unit,
     onUnhook: (String) -> Unit,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var className by remember { mutableStateOf(state.classQuery) }
@@ -68,22 +77,19 @@ fun DebugScreen(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         item {
-            Spacer(Modifier.height(16.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("实时调试", style = MaterialTheme.typography.headlineSmall)
-                    Text(
-                        "对目标进程内的方法挂 Hook，可观察参数与返回值，并可改写返回值",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                if (state.busy) {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                } else {
-                    TextButton(onClick = onRefresh) { Text("刷新") }
-                }
-            }
+            Spacer(Modifier.height(8.dp))
+            SubPageHeader(
+                title = "实时调试",
+                subtitle = "对目标进程内的方法挂 Hook，可观察参数与返回值，并可改写返回值",
+                onBack = onBack,
+                trailing = {
+                    if (state.busy) {
+                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    } else {
+                        TextButton(onClick = onRefresh) { Text("刷新") }
+                    }
+                },
+            )
         }
 
         // ---- Attachment ---------------------------------------------------
@@ -234,17 +240,34 @@ fun DebugScreen(
                         )
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(
-                                onClick = { onHookTrace(method.signature) },
-                                enabled = !state.busy,
-                            ) { Text("跟踪调用") }
-                            OutlinedButton(
+                            // Which of the two actions is primary comes from
+                            // 设置 → 调试 → Hook 默认行为; the other one stays one
+                            // tap away so the default never removes an option.
+                            val defaultTrace = defaultHookMode == HookMode.Trace
+                            Button(
                                 onClick = {
-                                    returnSignature = method.signature
-                                    returnValue = defaultLiteralFor(method.returnType)
+                                    if (defaultTrace) {
+                                        onHookTrace(method.signature)
+                                    } else {
+                                        returnSignature = method.signature
+                                        returnValue = defaultLiteralFor(method.returnType)
+                                    }
                                 },
                                 enabled = !state.busy,
-                            ) { Text("改返回值") }
+                            ) {
+                                Text(if (defaultTrace) "跟踪调用（默认）" else "改返回值（默认）")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    if (defaultTrace) {
+                                        returnSignature = method.signature
+                                        returnValue = defaultLiteralFor(method.returnType)
+                                    } else {
+                                        onHookTrace(method.signature)
+                                    }
+                                },
+                                enabled = !state.busy,
+                            ) { Text(if (defaultTrace) "改返回值" else "跟踪调用") }
                         }
                     }
                 }
@@ -326,8 +349,11 @@ fun DebugScreen(
 
         // ---- Messages --------------------------------------------------------
         if (state.messages.isNotEmpty()) {
-            item { Text("日志", style = MaterialTheme.typography.titleSmall) }
-            items(state.messages.takeLast(40)) { message ->
+            // The list is already bounded by the platform (设置 → 调试 → 日志上限),
+            // so it is rendered whole instead of being truncated a second time
+            // with a different, invisible limit.
+            item { Text("日志 (${state.messages.size})", style = MaterialTheme.typography.titleSmall) }
+            items(state.messages) { message ->
                 Text(
                     message.text,
                     style = MaterialTheme.typography.bodySmall,

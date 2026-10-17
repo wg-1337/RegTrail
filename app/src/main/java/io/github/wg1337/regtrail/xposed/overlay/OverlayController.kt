@@ -2,6 +2,7 @@ package io.github.wg1337.regtrail.xposed.overlay
 
 import android.app.Application
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
@@ -11,6 +12,7 @@ import android.view.WindowManager
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
+import io.github.wg1337.regtrail.agent.AgentConfig
 import io.github.wg1337.regtrail.shared.bridge.BridgeApi
 import io.github.wg1337.regtrail.shared.model.OverlaySizeLimits
 import io.github.wg1337.regtrail.xposed.RegTrailLog
@@ -18,6 +20,9 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import io.github.wg1337.regtrail.xposed.agent.InProcessAgent
+import io.github.wg1337.regtrail.xposed.bridge.InProcessJobs
+import io.github.wg1337.regtrail.xposed.mem.MemorySessions
 import io.github.wg1337.regtrail.xposed.script.ScriptEngine
 import io.github.wg1337.regtrail.xposed.script.ScriptLifecycleBridge
 import io.github.wg1337.regtrail.xposed.RegTrailModule
@@ -28,9 +33,13 @@ import io.github.wg1337.regtrail.xposed.debug.ActivityTracker
 import io.github.wg1337.regtrail.xposed.debug.DebugEngine
 import io.github.wg1337.regtrail.xposed.debug.InstanceRegistry
 import io.github.wg1337.regtrail.xposed.hook.TargetRegistry
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Owns the injected floating window for one target process.
@@ -315,6 +324,9 @@ internal class OverlayController(
             onCollapsedChanged = { collapsed -> applyCollapsed(collapsed) },
         )
         view.onDrag = { dx, dy -> moveBy(dx, dy) }
+        // See [setImeFocus]: while a text field in the page is being edited this
+        // window is focusable, and BACK has to drop that focus again.
+        view.onBack = { main.post { setImeFocus(false) } }
 
         offsetX = (snapshot.overlayDefaultX * screenWidth(wm)).toInt()
         offsetY = (snapshot.overlayDefaultY * screenHeight(wm)).toInt()
@@ -462,6 +474,7 @@ internal class OverlayController(
             val px = OverlaySizeMath.px(context, clamped.first, clamped.second)
             lp.width = px.first
             lp.height = px.second
+            snapIntoBounds(context, wm, px.first, px.second)
             lp.x = offsetX
             lp.y = offsetY
             runCatching { wm.updateViewLayout(view, lp) }
@@ -477,6 +490,35 @@ internal class OverlayController(
                 configHeightDp = configSizeDp.second,
             )
         }
+    }
+
+    /**
+     * Pulls the window back so that a size change cannot hide its own grip.
+     *
+     * ## Why this exists
+     * Growing the window from the resize grip extends it **right and down** from
+     * its top-left corner. A panel docked near the bottom-right of the screen
+     * therefore pushes its own bottom-right — where the grip lives — off the
+     * display, and with `FLAG_LAYOUT_NO_LIMITS` the system will happily let it.
+     * The result is a window the user cannot shrink back: the one failure mode the
+     * size limits were supposed to make impossible.
+     *
+     * The rule is "fully on screen when it fits, otherwise keep [KEEP_ON_SCREEN_DP]
+     * px visible", which is the same rule [moveBy] applies to a drag.
+     */
+    private fun snapIntoBounds(
+        context: Context,
+        wm: WindowManager,
+        widthPx: Int,
+        heightPx: Int,
+    ) {
+        val keep = dp(context, KEEP_ON_SCREEN_DP)
+        val minX = keep - widthPx
+        val minY = keep - heightPx
+        val maxX = maxOf(minX, screenWidth(wm) - widthPx)
+        val maxY = maxOf(minY, screenHeight(wm) - heightPx)
+        offsetX = offsetX.coerceIn(minX, maxX)
+        offsetY = offsetY.coerceIn(minY, maxY)
     }
 
     /**
@@ -512,6 +554,40 @@ internal class OverlayController(
         decorFallback?.let { it.setCollapsed(it.isCollapsed) }
     }
 
+    /**
+     * Adds or removes input focus from the overlay window.
+     *
+     * ## Why the window is normally not focusable
+     * `FLAG_NOT_FOCUSABLE` is what stops the panel from stealing the keyboard, the
+     * BACK key and the IME from the host app while the user is only reading it.
+     *
+     * ## Why it has to be lifted for text fields
+     * The soft keyboard attaches to the *focused window*. A `FLAG_NOT_FOCUSABLE`
+     * window cannot take input focus, so an `<input>` inside it draws a caret that
+     * never produces a keyboard — the 内存 search box, the Agent chat box and the
+     * tool console would all be decorative. That is why the page calls `imeFocus`
+     * before a field is edited, and why [FloatingOverlayView.dispatchKeyEvent]
+     * routes BACK back to `false`: the first BACK closes the keyboard, the next one
+     * reaches the host app.
+     *
+     * The DecorView fallback needs none of this: it lives inside the Activity's own
+     * window, which is focusable already, so `overlayView` is null there and this
+     * method returns immediately.
+     */
+    private fun setImeFocus(focused: Boolean) {
+        val wm = windowManager ?: return
+        val lp = params ?: return
+        val view = overlayView ?: return
+
+        val notFocusable = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        val updated = if (focused) lp.flags and notFocusable.inv() else lp.flags or notFocusable
+        if (updated == lp.flags) return
+
+        lp.flags = updated
+        val applied = runCatching { wm.updateViewLayout(view, lp) }.isSuccess
+        RegTrailLog.d("${param.packageName}: overlay ime focus=$focused applied=$applied")
+    }
+
     private fun resizeForCollapsed(collapsed: Boolean) {
         val wm = windowManager ?: return
         val lp = params ?: return
@@ -523,6 +599,9 @@ internal class OverlayController(
         } else {
             lp.width = dp(view.context, panelSizeDp.first.toFloat())
             lp.height = dp(view.context, panelSizeDp.second.toFloat())
+            // Expanding grows the window down-right from the same origin: pull it
+            // back on screen so the grip (and the 关闭 button) stay reachable.
+            snapIntoBounds(view.context, wm, lp.width, lp.height)
         }
         lp.x = offsetX
         lp.y = offsetY
@@ -618,6 +697,26 @@ internal class OverlayController(
             loader = param.defaultClassLoader,
         )
 
+    /**
+     * The same tool dispatch, plus a cancellation flag.
+     *
+     * Only the in-window Agent can cancel: it runs inside a [InProcessJobs] job
+     * whose cancel button must be able to stop a 64 MiB `mem_scan` mid-pass. The
+     * settings-app path has no equivalent handle (its Binder call has its own
+     * timeout), so [runTool] keeps passing a constant `false`.
+     */
+    private fun runTool(
+        name: String,
+        args: JsonObject,
+        shouldStop: () -> Boolean,
+    ): BridgeApi.Response = AgentTools.run(
+        name = name,
+        args = args,
+        context = appContext,
+        loader = param.defaultClassLoader,
+        shouldStop = shouldStop,
+    )
+
     override fun statusJson(): JsonObject = buildJsonObject {
         put("moduleLoaded", JsonPrimitive(true))
         put("package", JsonPrimitive(param.packageName))
@@ -657,6 +756,39 @@ internal class OverlayController(
         put("targets", buildJsonArray {
             TargetRegistry.snapshot().forEach { add(JsonPrimitive(it)) }
         })
+        // Geometry the page needs to clamp a resize *before* it happens. Without
+        // these the grip has to wait for a native round trip per frame to discover
+        // it hit the wall, which is exactly what made the drag feel broken.
+        screenMetrics().forEach { (key, element) -> put(key, element) }
+    }
+
+    /**
+     * Screen bounds and resize limits, in the units the page works in (dp).
+     *
+     * Mirrors [OverlaySizeLimits] so the grip can clamp client-side and "hit a
+     * wall" instead of fighting the native clamp. The native clamp stays
+     * authoritative — a stale page can only be optimistic, never produce a window
+     * the user cannot reach.
+     */
+    private fun screenMetrics(): JsonObject {
+        val context = appContext ?: return buildJsonObject {
+            put("density", JsonPrimitive(1))
+        }
+        val density = context.resources.displayMetrics.density.coerceAtLeast(0.1f)
+        val widthPx = screenWidthPx(context)
+        val heightPx = screenHeightPx(context)
+        return buildJsonObject {
+            put("screenWidthPx", JsonPrimitive(widthPx))
+            put("screenHeightPx", JsonPrimitive(heightPx))
+            put("screenWidthDp", JsonPrimitive((widthPx / density).toInt()))
+            put("screenHeightDp", JsonPrimitive((heightPx / density).toInt()))
+            put("density", JsonPrimitive(density))
+            put("minWidthDp", JsonPrimitive(OverlaySizeLimits.MIN_WIDTH_DP))
+            put("minHeightDp", JsonPrimitive(OverlaySizeLimits.MIN_HEIGHT_DP))
+            put("maxWidthDp", JsonPrimitive(OverlaySizeLimits.maxWidthDp(widthPx, density)))
+            put("maxHeightDp", JsonPrimitive(OverlaySizeLimits.maxHeightDp(heightPx, density)))
+            put("screenFraction", JsonPrimitive(OverlaySizeLimits.MAX_SCREEN_FRACTION))
+        }
     }
 
     /**
@@ -687,7 +819,12 @@ internal class OverlayController(
         }
 
         "collapse" -> {
-            main.post { applyCollapsed(true) }
+            main.post {
+                // A collapsed window has no text fields, and leaving it focusable
+                // would keep the IME attached to a 112 dp pill.
+                setImeFocus(false)
+                applyCollapsed(true)
+            }
             null
         }
 
@@ -698,11 +835,16 @@ internal class OverlayController(
 
         "hide" -> {
             main.post {
+                setImeFocus(false)
                 overlayView?.let { runCatching { windowManager?.removeView(it) } }
                 // The DecorView mechanism has no window to remove: hiding means
                 // detaching the view and not re-attaching on the next resume.
                 decorFallback?.setHidden(true)
             }
+            // Nothing may keep reading memory or sitting in a socket after the
+            // user has dismissed the window: that work would be invisible, and the
+            // Agent one would keep costing tokens.
+            InProcessJobs.cancelAll()
             null
         }
 
@@ -738,7 +880,32 @@ internal class OverlayController(
 
         "runScript" -> webRunScript(payloadJson)
 
+        // ---- 内存：直接读写本进程自己的内存，不需要 Root ------------------
+        // The scan/refine run in the background and answer inline when they can
+        // (see `InProcessJobs` for why the page cannot simply wait).
+        "memScan" -> webMemScan(payloadJson)
+        "memRefine" -> webMemRefine(payloadJson)
+        "memWrite" -> webMemWrite(payloadJson)
+        "memRevert" -> webMemRevert(payloadJson)
+        "memSessions" -> webMemSessions()
+        "memClear" -> webMemClear()
+        "jobPoll" -> webJobPoll(payloadJson)
+        "jobCancel" -> webJobCancel(payloadJson)
+
+        // ---- Agent：在同一进程里驱动已有工具 + 模型 ReAct 循环 ------------
+        "agentTool" -> webAgentTool(payloadJson)
+        "agentChat" -> webAgentChat(payloadJson)
+        "agentState" -> webAgentState()
+        "agentReset" -> webAgentReset()
+
         "status" -> webStatusJson()
+
+        // The page's text fields ask for real input focus before the IME is needed.
+        "imeFocus" -> {
+            val focused = payloadBool(payloadJson, "focused") ?: false
+            main.post { setImeFocus(focused) }
+            null
+        }
 
         "log" -> {
             RegTrailLog.d("ui: $payloadJson")
@@ -787,6 +954,10 @@ internal class OverlayController(
                     JsonPrimitive(clamped.first != widthDp || clamped.second != heightDp),
                 )
                 put("final", JsonPrimitive(isFinal))
+                // The screen may have rotated since the page booted; sending the
+                // limits with every resize keeps the grip's client-side clamp
+                // correct without an extra `status` round trip per drag.
+                screenMetrics().forEach { (key, element) -> put(key, element) }
             },
         )
     }
@@ -900,6 +1071,359 @@ internal class OverlayController(
             ?.contentOrNull
             ?.let { it == "true" || it == "1" }
     }.getOrNull()
+
+    /**
+     * Reads a nested object field out of a bridge payload.
+     *
+     * `agentTool` takes `{"name":"…","args":{…}}` and the args object has to reach
+     * `AgentTools.run` unchanged — a model asks for `{"limit":200}` and the tool
+     * reads a number, not a string. Parsing it here keeps every action's payload
+     * handling symmetric.
+     */
+    private fun payloadObject(payloadJson: String, key: String): JsonObject? = runCatching {
+        BridgeApi.json.parseToJsonElement(payloadJson).jsonObject[key] as? JsonObject
+    }.getOrNull()
+
+    // -----------------------------------------------------------------------
+    // 内存 tab (in-process, no root)
+    // -----------------------------------------------------------------------
+
+    /**
+     * First scan: `{"type":"int32","value":"100","writableOnly":false}`.
+     *
+     * The reply is the completed result when the scan fits into
+     * [InProcessJobs.defaultWaitMs], otherwise `{"pending":true,"job":N}` and the
+     * page polls [webJobPoll]. Both shapes carry the same fields, so the page has
+     * exactly one renderer.
+     */
+    private fun webMemScan(payloadJson: String): String {
+        val type = payloadString(payloadJson, "type") ?: "int32"
+        val value = payloadString(payloadJson, "value")
+            ?: return webError("请先输入要搜索的值")
+        val writableOnly = payloadBool(payloadJson, "writableOnly") ?: false
+        val maxResults = payloadInt(payloadJson, "maxResults")
+            ?: MemorySessions.DEFAULT_MAX_RESULTS
+
+        val job = InProcessJobs.submit("memScan", InProcessJobs.Lane.MEMORY) { handle ->
+            MemorySessions.scan(
+                typeRaw = type,
+                value = value,
+                writableOnly = writableOnly,
+                maxResults = maxResults,
+                shouldStop = { handle.cancelled },
+            )
+        }
+        return webJobReply(job, InProcessJobs.defaultWaitMs)
+    }
+
+    /** Next scan: `{"session":3,"value":"101"}`. */
+    private fun webMemRefine(payloadJson: String): String {
+        val session = payloadInt(payloadJson, "session")
+            ?: return webError("请先做一次首次扫描")
+        val value = payloadString(payloadJson, "value")
+            ?: return webError("请输入数值变化后的新值")
+        val type = payloadString(payloadJson, "type")
+        val maxResults = payloadInt(payloadJson, "maxResults")
+            ?: MemorySessions.DEFAULT_MAX_RESULTS
+
+        val job = InProcessJobs.submit("memRefine", InProcessJobs.Lane.MEMORY) { handle ->
+            MemorySessions.refine(
+                sessionId = session,
+                value = value,
+                typeRaw = type,
+                maxResults = maxResults,
+                shouldStop = { handle.cancelled },
+            )
+        }
+        return webJobReply(job, InProcessJobs.defaultWaitMs)
+    }
+
+    /**
+     * Writes one value: `{"addr":"0x7f…","type":"int32","value":"999"}`.
+     *
+     * Deliberately synchronous: it is a handful of syscalls, and the page needs the
+     * result (including the original bytes) before it can offer 「还原」.
+     *
+     * The UI is responsible for the confirmation step — see the 内存 tab's
+     * two-stage 「写入」/「确认写入」 button. Native code cannot enforce that, and
+     * it must not pretend to: the requirement is that the *user* confirms, not
+     * that the bridge refuses.
+     */
+    private fun webMemWrite(payloadJson: String): String = runCatching {
+        MemorySessions.write(
+            addressRaw = payloadString(payloadJson, "addr"),
+            typeRaw = payloadString(payloadJson, "type"),
+            value = payloadString(payloadJson, "value"),
+        )
+    }.fold(
+        onSuccess = { webOk(it) },
+        onFailure = { webError(it.message ?: "写入失败") },
+    )
+
+    /** Restores one address, or every modified one when `addr` is absent. */
+    private fun webMemRevert(payloadJson: String): String = runCatching {
+        MemorySessions.revert(payloadString(payloadJson, "addr"))
+    }.fold(
+        onSuccess = { webOk(it) },
+        onFailure = { webError(it.message ?: "还原失败") },
+    )
+
+    /** Sessions + modified addresses, for the 内存 tab's 「已修改」 section. */
+    private fun webMemSessions(): String = runCatching {
+        webOk(MemorySessions.describe())
+    }.getOrElse { webError(it.message ?: "读取内存状态失败") }
+
+    /** Drops every session and forgets the remembered originals. */
+    private fun webMemClear(): String = runCatching {
+        webOk(MemorySessions.clear())
+    }.getOrElse { webError(it.message ?: "清空失败") }
+
+    /**
+     * Polls a job started by `memScan` / `memRefine` / `agentChat`.
+     *
+     * Answers `{"ok":true,"data":{…,"pending":false}}` when it finished,
+     * `{"ok":true,"data":{"pending":true,"progress":…}}` while it runs, and the
+     * normal error envelope when it failed.
+     */
+    private fun webJobPoll(payloadJson: String): String {
+        val id = payloadInt(payloadJson, "job") ?: return webError("jobPoll 需要 job 编号")
+        val job = InProcessJobs.find(id)
+            ?: return webError("任务 $id 不存在（可能已经结束并被回收）")
+        return webJobReply(job, 0L)
+    }
+
+    /** Best-effort cancellation: the reply says whether the job was still running. */
+    private fun webJobCancel(payloadJson: String): String {
+        val id = payloadInt(payloadJson, "job") ?: return webError("jobCancel 需要 job 编号")
+        val cancelled = InProcessJobs.cancel(id)
+        return webOk(buildJsonObject {
+            put("job", JsonPrimitive(id))
+            put("cancelled", JsonPrimitive(cancelled))
+        })
+    }
+
+    /**
+     * The one place a job becomes a bridge reply.
+     *
+     * @param waitMs how long to block *this* call before answering "still running".
+     *   0 for actions that are always asynchronous (a model turn), the usual
+     *   [InProcessJobs.defaultWaitMs] for ones that are usually fast.
+     */
+    private fun webJobReply(job: InProcessJobs.Handle, waitMs: Long): String {
+        if (waitMs > 0L) InProcessJobs.await(job, waitMs)
+
+        job.error?.let { message -> return webError(message) }
+
+        val data = job.data
+        return webOk(
+            buildJsonObject {
+                // Flatten the finished payload into the reply, so a caller sees
+                // `{"session":1,"count":N,…}` exactly as the protocol documents.
+                data?.forEach { (key, element) -> put(key, element) }
+                put("pending", JsonPrimitive(data == null))
+                put("job", JsonPrimitive(job.id))
+                put("kind", JsonPrimitive(job.kind))
+                put("progress", JsonPrimitive(job.progress))
+                put("elapsedMs", JsonPrimitive(job.elapsedMs))
+            },
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent tab (runs in this process)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Configuration state for the Agent tab.
+     *
+     * Answers "why can I not chat" before the user types anything: no key, no
+     * INTERNET permission, or simply not published yet. **Never contains the key**;
+     * `hasKey` is a boolean and `baseUrl`/`model` are not secrets.
+     */
+    private fun webAgentState(): String {
+        val snapshot = config.snapshot()
+        return webOk(
+            buildJsonObject {
+                put("configured", JsonPrimitive(snapshot.agentConfigured))
+                put("hasKey", JsonPrimitive(snapshot.agentApiKey.isNotBlank()))
+                put("baseUrl", JsonPrimitive(snapshot.agentBaseUrl))
+                put("model", JsonPrimitive(snapshot.agentModel))
+                put("internet", JsonPrimitive(hasInternetPermission()))
+                put("messages", JsonPrimitive(InProcessAgent.pending()))
+                put("memSession", JsonPrimitive(MemorySessions.current() ?: 0))
+                put(
+                    "maxRounds",
+                    JsonPrimitive(
+                        if (snapshot.agentMaxRounds > 0) {
+                            snapshot.agentMaxRounds
+                        } else {
+                            DEFAULT_AGENT_ROUNDS
+                        },
+                    ),
+                )
+                put("tools", buildJsonArray {
+                    InProcessAgent.toolNames().forEach { add(JsonPrimitive(it)) }
+                })
+            },
+        )
+    }
+
+    /**
+     * Runs one tool directly: `{"name":"list_activities","args":{…}}`.
+     *
+     * This is the 「工具控制台」 and also the same entry point the Agent loop uses,
+     * so what the console shows is exactly what the model would have received.
+     */
+    private fun webAgentTool(payloadJson: String): String {
+        val name = payloadString(payloadJson, "name") ?: return webError("缺少工具名")
+        val args = payloadObject(payloadJson, "args") ?: JsonObject(emptyMap())
+        RegTrailLog.d("ui: agentTool $name")
+
+        val response = runToolOnMain(name, args)
+        return webOk(
+            buildJsonObject {
+                put("name", JsonPrimitive(name))
+                put("toolOk", JsonPrimitive(response.ok))
+                put("text", JsonPrimitive(InProcessAgent.renderToolResult(response)))
+                put("json", response.data)
+            },
+        )
+    }
+
+    /**
+     * One Agent turn: `{"message":"…","allowDestructive":false}`.
+     *
+     * Always asynchronous. A model turn is a network round trip and several tool
+     * executions; blocking the WebView's bridge thread for that would freeze the
+     * panel — the exact failure mode this whole job mechanism exists to avoid.
+     */
+    private fun webAgentChat(payloadJson: String): String {
+        val message = payloadString(payloadJson, "message")
+            ?: return webError("请输入要问 Agent 的内容")
+        val allowDestructive = payloadBool(payloadJson, "allowDestructive") ?: false
+
+        val snapshot = config.snapshot()
+        if (!snapshot.agentConfigured) {
+            return webError(
+                "Agent 未配置：请在 RegTrail 设置端填写 Base URL、模型与 API Key，" +
+                    "然后在窗口里点「重载配置」",
+            )
+        }
+        // The target app owns the permission, not RegTrail: a host without
+        // INTERNET can never reach any endpoint, and saying so beats a socket
+        // timeout the user would read as a hang.
+        if (!hasInternetPermission()) {
+            return webError(
+                "目标应用没有 INTERNET 权限，无法在本进程内调用模型接口。" +
+                    "可以改用设置端的 Agent，或给该应用放行网络。",
+            )
+        }
+
+        val agentConfig = AgentConfig(
+            baseUrl = snapshot.agentBaseUrl,
+            apiKey = snapshot.agentApiKey,
+            model = snapshot.agentModel,
+            maxToolRounds = if (snapshot.agentMaxRounds > 0) {
+                snapshot.agentMaxRounds
+            } else {
+                DEFAULT_AGENT_ROUNDS
+            },
+        )
+
+        val job = InProcessJobs.submit("agentChat", InProcessJobs.Lane.AGENT) { handle ->
+            val outcome = InProcessAgent.chat(
+                config = agentConfig,
+                prompt = message,
+                allowDestructive = allowDestructive,
+                // The loop's tools are this process's tools: same dispatcher the
+                // console and the settings-side bridge use (`AgentTools.run`), so
+                // there is exactly one implementation of every tool. The cancel
+                // flag is threaded through, so 「停止」 stops a running mem_scan.
+                execute = { name, args -> runToolOnMain(name, args) { handle.cancelled } },
+                shouldStop = { handle.cancelled },
+                onStep = { step -> handle.report(step) },
+            )
+            buildJsonObject {
+                put("reply", JsonPrimitive(outcome.reply))
+                put("steps", buildJsonArray {
+                    outcome.steps.forEach { add(JsonPrimitive(it)) }
+                })
+                put("allowDestructive", JsonPrimitive(allowDestructive))
+                put("messages", JsonPrimitive(InProcessAgent.pending()))
+            }
+        }
+        RegTrailLog.i("ui: agentChat (destructive=$allowDestructive)")
+        return webJobReply(job, 0L)
+    }
+
+    /** Forgets the conversation so the next turn starts fresh. */
+    private fun webAgentReset(): String {
+        InProcessAgent.reset()
+        return webOk(buildJsonObject {
+            put("reset", JsonPrimitive(true))
+            put("messages", JsonPrimitive(InProcessAgent.pending()))
+        })
+    }
+
+    /**
+     * Runs a tool, hopping to the main thread for the one tool that needs it.
+     *
+     * `dump_view_tree` walks the live `View` hierarchy, and `View` is not
+     * thread-safe: reading `width`/`childCount` off the main thread can throw or,
+     * worse, return a torn tree. Every other tool is pure reflection and is happy
+     * on the bridge/JO thread.
+     *
+     * The wait is bounded: if the host app's main thread is wedged, a tool that
+     * "never returns" would freeze the panel with no explanation. A timeout
+     * converts that into an error message, and the queued runnable is harmless.
+     */
+    private fun runToolOnMain(
+        name: String,
+        args: JsonObject,
+        shouldStop: () -> Boolean = { false },
+    ): BridgeApi.Response {
+        if (name != "dump_view_tree") return runTool(name, args, shouldStop)
+        if (Looper.myLooper() == Looper.getMainLooper()) return runTool(name, args, shouldStop)
+
+        val latch = CountDownLatch(1)
+        val result = AtomicReference<BridgeApi.Response?>(null)
+        val posted = main.post {
+            result.set(
+                runCatching { runTool(name, args, shouldStop) }.getOrElse {
+                    BridgeApi.Response(
+                        ok = false,
+                        error = it.message ?: "工具执行失败",
+                        data = JsonNull,
+                    )
+                },
+            )
+            latch.countDown()
+        }
+        if (!posted) return BridgeApi.Response(false, "主线程不可用", JsonNull)
+        if (!latch.await(TOOL_MAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            return BridgeApi.Response(false, "主线程繁忙，未能执行 $name", JsonNull)
+        }
+        return result.get() ?: BridgeApi.Response(false, "工具没有返回结果", JsonNull)
+    }
+
+    /**
+     * True when **this** process holds `android.permission.INTERNET`.
+     *
+     * `Context.checkPermission(…, myPid, myUid)` asks about the calling process,
+     * which inside the injected window is the target app — the app whose socket
+     * the request would be made from. A false answer here is the difference between
+     * "the feature is broken" and "this app has no network permission".
+     */
+    private fun hasInternetPermission(): Boolean {
+        val context = appContext ?: return false
+        return runCatching {
+            context.checkPermission(
+                android.Manifest.permission.INTERNET,
+                android.os.Process.myPid(),
+                android.os.Process.myUid(),
+            ) == PackageManager.PERMISSION_GRANTED
+        }.getOrDefault(false)
+    }
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -1027,5 +1551,23 @@ internal class OverlayController(
          * therefore enough to recover from a drag that overshoots.
          */
         const val KEEP_ON_SCREEN_DP = 48f
+
+        /**
+         * Tool rounds one Agent turn may use when the config publishes no limit.
+         *
+         * Six is enough for the common "find the class → read the field → hook it"
+         * chain and short enough that a confused model cannot spend a large budget
+         * before the user sees anything.
+         */
+        const val DEFAULT_AGENT_ROUNDS = 6
+
+        /**
+         * How long a tool may take when it must run on the main thread.
+         *
+         * Only `dump_view_tree` needs this. Three seconds is generous for walking a
+         * `View` tree and short enough that a wedged host main thread produces an
+         * error instead of a frozen panel.
+         */
+        const val TOOL_MAIN_TIMEOUT_MS = 3_000L
     }
 }

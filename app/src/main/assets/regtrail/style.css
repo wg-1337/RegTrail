@@ -130,10 +130,10 @@ button.icon:active { background: rgba(255, 255, 255, 0.08); }
   position: absolute;
   inset: 0;
   /* Bottom padding keeps the last row of buttons clear of the resize grip, whose
-     touch target sits in the bottom-right 28 px of the panel. Content ends 30 px
+     touch target sits in the bottom-right 30 px of the panel. Content ends 34 px
      above the edge, so the two never overlap and a tap near the corner still
      reaches the button. */
-  padding: 10px 10px 30px;
+  padding: 10px 10px 34px;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -143,28 +143,32 @@ button.icon:active { background: rgba(255, 255, 255, 0.08); }
 /* ---- Resize grip ----------------------------------------------------- */
 /*
  * The grip is the whole resize affordance: it drags the window's bottom-right
- * corner and posts a `resize` message to native code, which owns the actual
- * window size. The visible part is drawn with gradients only — no image, no font
- * — because the window's CSP allows `img-src 'self' data:` and nothing else.
- *
- * The element is deliberately larger (34 dp) than the stripes it draws (18 dp):
- * the stripes are the affordance, but the *touch target* is what makes the drag
- * reliable with a fingertip.
+ * corner. The page applies the size to `#panel` itself as the finger moves and
+ * tells native code at most once per animation frame; native code owns the real
+ * window and the persisted value.
  *
  * `touch-action: none` is required: without it the WebView treats a drag that
- * starts here as a scroll gesture and the pointer move stream stops arriving.
+ * starts here as a scroll gesture, the pointer move stream stops arriving after a
+ * few pixels, and the drag dies mid-way — one of the reasons resizing felt
+ * broken.
+ *
+ * The element is deliberately larger (30 dp) than the stripes it draws (16 dp):
+ * the stripes are the affordance, but the *touch target* is what makes the drag
+ * reliable with a fingertip. 28–32 dp is the comfortable range for a corner
+ * handle that must not be grabbed by accident while scrolling the panel.
  */
 #grip {
   position: absolute;
   right: 0;
   bottom: 0;
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
   z-index: 10;
   cursor: nwse-resize;
   touch-action: none;
   -webkit-user-select: none;
   user-select: none;
+  -webkit-touch-callout: none;
 }
 
 #grip::after {
@@ -185,6 +189,19 @@ button.icon:active { background: rgba(255, 255, 255, 0.08); }
 
 #grip:active::after,
 body.dragging #grip::after { opacity: 1; }
+
+/*
+ * While a drag is in flight: no text selection, no scrolling, no long-press
+ * callout. A resize that also selects the panel's labels or scrolls the log
+ * underneath is the difference between "a handle" and "a fight".
+ */
+body.dragging {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: nwse-resize;
+}
+
+body.dragging .view { overflow: hidden; }
 
 /*
  * Collapsed: the window is a pill and *must not* be resizable. Hiding the grip is
@@ -239,6 +256,13 @@ button.action:active {
   border-color: var(--regtrail-primary);
 }
 
+button.action:disabled {
+  opacity: 0.42;
+  background: var(--bg-elev);
+  color: var(--fg-dim);
+  border-color: var(--line);
+}
+
 /* ---- Log ------------------------------------------------------------- */
 #log {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -258,6 +282,9 @@ button.action:active {
   font-size: calc(10.5px * var(--regtrail-font-scale));
   margin: 6px 0 0;
 }
+
+/* A hint that is really a warning (missing config, no INTERNET permission). */
+.hint.error { color: #ff7b72; }
 
 /* ---- Tools: script list ---------------------------------------------- */
 #scripts { margin-top: 4px; }
@@ -324,4 +351,206 @@ button.action:active {
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.18);
   border-radius: 2px;
+}
+
+/* ---- Form controls --------------------------------------------------- */
+/*
+ * The WebView renders `<select>`/`<input>` with the platform's own widgets. They
+ * are re-skinned here only so they match the panel's colours and font scale; the
+ * native picker (which is what a `<select>` opens inside a WebView) is untouched,
+ * because a 220 dp-wide panel cannot host a usable list of options itself.
+ */
+.input,
+.select {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: calc(11.5px * var(--regtrail-font-scale));
+}
+
+.input:focus,
+.select:focus {
+  outline: none;
+  border-color: var(--regtrail-primary);
+}
+
+.input::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
+
+button.action.narrow {
+  flex: 0 0 auto;
+  padding: 7px 12px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  color: var(--fg-dim);
+  font-size: calc(10.5px * var(--regtrail-font-scale));
+  line-height: 1.3;
+}
+
+.check input {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--regtrail-primary);
+}
+
+/* ---- Memory results -------------------------------------------------- */
+#mem-results { margin-top: 2px; }
+
+.mem-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.mem-row:last-child { border-bottom: none; }
+
+.mem-row .addr {
+  flex: 0 0 auto;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10px * var(--regtrail-font-scale));
+  color: var(--regtrail-primary);
+}
+
+.mem-row .val {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10.5px * var(--regtrail-font-scale));
+  word-break: break-all;
+}
+
+button.mini {
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: calc(10.5px * var(--regtrail-font-scale));
+  cursor: pointer;
+}
+
+button.mini:active { background: var(--regtrail-primary); color: #101014; }
+
+button.mini.danger {
+  border-color: #ff7b72;
+  color: #ffb3ad;
+}
+
+button.mini.danger:active {
+  background: #ff7b72;
+  color: #101014;
+}
+
+/* Inline editor + the mandatory confirmation bar for a memory write. */
+.mem-edit {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 0 8px;
+}
+
+.mem-edit .input { flex: 1 1 100%; }
+
+.mem-confirm {
+  flex: 1 1 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 7px;
+  border: 1px solid #ff7b72;
+  border-radius: 8px;
+  background: rgba(255, 123, 114, 0.10);
+}
+
+.mem-confirm .text {
+  flex: 1 1 100%;
+  color: #ffb3ad;
+  font-size: calc(10.5px * var(--regtrail-font-scale));
+  word-break: break-all;
+}
+
+/* ---- Agent ----------------------------------------------------------- */
+#agent-log {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+
+#agent-log:empty { display: none; }
+
+.msg {
+  padding: 5px 7px;
+  border-radius: 9px;
+  font-size: calc(11px * var(--regtrail-font-scale));
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.msg.user {
+  background: rgba(255, 179, 0, 0.14);
+  color: var(--fg);
+}
+
+.msg.assistant {
+  background: var(--bg-elev);
+  color: var(--fg);
+}
+
+.msg.tool {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--fg-dim);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10px * var(--regtrail-font-scale));
+}
+
+.msg.error {
+  background: rgba(255, 123, 114, 0.12);
+  color: #ffb3ad;
+}
+
+details#agent-console {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+details#agent-console summary {
+  color: var(--fg-dim);
+  font-size: calc(11px * var(--regtrail-font-scale));
+  cursor: pointer;
+}
+
+.console-out {
+  max-height: 200px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 6px 7px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--fg-dim);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10px * var(--regtrail-font-scale));
+  white-space: pre-wrap;
+  word-break: break-all;
 }

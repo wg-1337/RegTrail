@@ -40,6 +40,15 @@ class TerminalSession {
     /** Working directory, tracked so the prompt can show it and `cd` can persist. */
     private var cwd: String = DEFAULT_CWD
 
+    /**
+     * Directory the "工作区" modes start in and that [ensureWorkspace] creates.
+     *
+     * Configurable from the settings app; defaults to [WORKSPACE]. Only the
+     * terminal follows it — the config-push path is fixed by `SharedPaths`
+     * because the module reads it from there.
+     */
+    private var workspace: String = WORKSPACE
+
     /** History for the up/down arrows in the UI. */
     private val history = ArrayDeque<String>()
 
@@ -47,9 +56,21 @@ class TerminalSession {
     // Session control
     // -----------------------------------------------------------------------
 
-    /** Opens the root shell. Safe to call repeatedly. */
-    suspend fun start(mode: Mode = Mode.Root): Unit = withContext(Dispatchers.IO) {
+    /**
+     * Opens the root shell.
+     *
+     * Safe to call repeatedly.
+     *
+     * @param workspacePath starting directory for the workspace-backed modes,
+     *   and the directory ensured to exist. Blank falls back to [WORKSPACE] so a
+     *   cleared setting can never produce a shell rooted at `/`.
+     */
+    suspend fun start(
+        mode: Mode = Mode.Root,
+        workspacePath: String = WORKSPACE,
+    ): Unit = withContext(Dispatchers.IO) {
         close()
+        workspace = workspacePath.trim().ifBlank { WORKSPACE }
         _state.value = SessionState(connected = false, mode = mode, busy = true)
 
         val created = runCatching { Shell.getShell() }.getOrNull()
@@ -99,7 +120,8 @@ class TerminalSession {
     }
 
     private suspend fun ensureWorkspace() {
-        run("mkdir -p $WORKSPACE && chmod 755 $WORKSPACE")
+        val path = quote(workspace)
+        run("mkdir -p $path && chmod 755 $path")
     }
 
     fun close() {
@@ -241,8 +263,8 @@ class TerminalSession {
         // `filesDir` is not a stable shell cwd across jobs, so start in the
         // shared scratch directory every mode can reach.
         Mode.App -> DEFAULT_CWD
-        Mode.Device -> WORKSPACE
-        Mode.HostContext -> WORKSPACE
+        Mode.Device -> workspace
+        Mode.HostContext -> workspace
         Mode.Root -> DEFAULT_CWD
     }
 
@@ -303,7 +325,13 @@ class TerminalSession {
     }
 
     companion object {
-        /** Shared workspace, also used by the module's spool directory. */
+        /**
+         * Default workspace, equal to `SharedPaths.BASE_DIR`.
+         *
+         * Kept as a separate constant because a *session* may be pointed at
+         * another directory from the settings app, while the module's spool and
+         * config path stay where `SharedPaths` says.
+         */
         const val WORKSPACE = "/data/local/tmp/regtrail"
 
         const val DEFAULT_CWD = "/data/local/tmp"

@@ -91,8 +91,58 @@ data class ModuleConfigSnapshot(
     val overlayWidthDp: Int = OverlaySizeLimits.DEFAULT_WIDTH_DP,
     val overlayHeightDp: Int = OverlaySizeLimits.DEFAULT_HEIGHT_DP,
 
+    /**
+     * Whether the module deoptimizes a method before hooking it.
+     *
+     * `deoptimize` is what makes a hook fire on a method the JIT already inlined
+     * into its callers; without it a hook can be installed and silently never
+     * run. It also forces a recompile of that method, which is measurable in a
+     * hot loop — hence the switch, and hence the default: `true` reproduces the
+     * behaviour every earlier build had, so an old `config.json` without this
+     * key keeps working (and keeps hooking) exactly as before.
+     */
+    val autoDeoptimize: Boolean = true,
+
     /** Which panels the window shows, in order. */
     val panels: List<String> = listOf("status", "log"),
+
+    // ---- Agent endpoint, published for the in-window Agent ----
+    //
+    // The floating window's Agent tab runs the model loop *inside the target
+    // process* (see `xposed/agent/InProcessAgent.kt`), because the tools it drives
+    // — live class loaders, object graphs, that process's own memory — exist
+    // nowhere else. That process therefore needs the endpoint settings, and the
+    // only channel between the settings app and a target process is this snapshot.
+    //
+    // ## The exposure this creates, stated plainly
+    // `/data/local/tmp/regtrail/config.json` is written `0644`, so any app on the
+    // device that knows that path can read it. Publishing [agentApiKey] therefore
+    // publishes the key device-wide, not just to RegTrail's own targets.
+    //
+    // That is an accepted, documented trade-off for this build:
+    //  - every field has a safe default (`""`), so a settings app that does not
+    //    fill these in decodes to "Agent 未配置" instead of failing to parse;
+    //  - the module never logs the key and never sends it to the WebView — see
+    //    `ModuleConfig.Snapshot.toJsonString`, which redacts it before the page
+    //    ever sees the config;
+    //  - the settings UI warns next to the key field, and the in-window Agent says
+    //    「未配置」 until it is filled in.
+    //
+    // Moving the key to a 0600 file or a RemotePreferences channel needs both
+    // halves (publisher and reader) to change together; changing only one silently
+    // breaks the Agent, so it is deliberately not done here.
+
+    /** Base URL *including* `/v1`, e.g. `https://api.openai.com/v1`. Empty = default. */
+    val agentBaseUrl: String = "",
+
+    /** Model name, e.g. `gpt-4o-mini`. Empty = default. */
+    val agentModel: String = "",
+
+    /** Bearer key for that endpoint. Empty means "Agent 未配置" in the window. */
+    val agentApiKey: String = "",
+
+    /** Tool rounds one turn may use; 0 = the module's own default. */
+    val agentMaxRounds: Int = 0,
 
     /** Scripts the module may auto-run, keyed by trigger (see docs/PLAN.md 5-③). */
     val scripts: List<ScriptSpec> = emptyList(),

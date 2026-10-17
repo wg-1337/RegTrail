@@ -2,6 +2,7 @@ package io.github.wg1337.regtrail.ui.screen
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -13,8 +14,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -27,6 +28,18 @@ import io.github.wg1337.regtrail.shared.model.SelfCheckReport
 import io.github.wg1337.regtrail.ui.RootStateUi
 import io.github.wg1337.regtrail.ui.debug.DebugUiState
 
+/**
+ * 总览 — readiness at a glance, plus the app's launcher pad.
+ *
+ * ## Why the quick actions exist
+ * The bottom bar only has four tabs now (总览 / 目标 / 设置 / Agent). Every live
+ * surface that lost its tab — 终端, 实时调试, 打包 — is reached from here in one
+ * tap, which is the constraint the restructure had to keep: nothing removed from
+ * the bar may become harder to reach.
+ *
+ * The card also names 设置 explicitly. The colour picker was unfindable before
+ * precisely because nothing on this screen pointed at the page that held it.
+ */
 @Composable
 fun HomeScreen(
     report: SelfCheckReport?,
@@ -34,8 +47,11 @@ fun HomeScreen(
     debugState: DebugUiState,
     rootState: RootStateUi,
     onGoToScope: () -> Unit,
-    onGoToSelfCheck: () -> Unit,
+    onGoToTerminal: () -> Unit,
     onGoToDebug: () -> Unit,
+    onGoToPatch: () -> Unit,
+    onGoToSelfCheck: () -> Unit,
+    onGoToSettings: () -> Unit,
     onRequestRoot: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -141,6 +157,27 @@ fun HomeScreen(
             }
         }
 
+        // ---- Quick actions -------------------------------------------------
+        SectionCard("快捷入口") {
+            Text(
+                "主题色、悬浮窗、终端、调试与模型的全部设置都在「设置」页；" +
+                    "下面这些是常用的工作界面。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                QuickAction("终端", onGoToTerminal, Modifier.weight(1f))
+                QuickAction("实时调试", onGoToDebug, Modifier.weight(1f))
+                QuickAction("打包", onGoToPatch, Modifier.weight(1f))
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                QuickAction("环境自检", onGoToSelfCheck, Modifier.weight(1f))
+                QuickAction("设置", onGoToSettings, Modifier.weight(1f))
+            }
+        }
+
         // ---- Framework summary --------------------------------------------
         SectionCard("LSPosed 框架") {
             if (scopeState.bound) {
@@ -185,17 +222,6 @@ fun HomeScreen(
             )
             KeyValue("已装 Hook", debugState.hookCount.toString())
             KeyValue("活动 Activity", debugState.activityCount.toString())
-            Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = onGoToDebug,
-                    modifier = Modifier.weight(1f),
-                ) { Text("打开调试") }
-                OutlinedButton(
-                    onClick = onGoToSelfCheck,
-                    modifier = Modifier.weight(1f),
-                ) { Text("环境自检") }
-            }
             if (!debugState.attached) {
                 Spacer(Modifier.height(6.dp))
                 Text(
@@ -229,6 +255,27 @@ private fun SectionCard(title: String, content: @Composable () -> Unit) {
             Spacer(Modifier.height(8.dp))
             content()
         }
+    }
+}
+
+/**
+ * One equal-width button in the quick-action block.
+ *
+ * `FilledTonalButton` rather than a plain `Button`: the block has five of them and
+ * filled buttons would compete with the readiness card's single primary action.
+ */
+@Composable
+private fun QuickAction(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    FilledTonalButton(
+        onClick = onClick,
+        modifier = modifier,
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+    ) {
+        Text(label, maxLines = 1, style = MaterialTheme.typography.labelLarge)
     }
 }
 

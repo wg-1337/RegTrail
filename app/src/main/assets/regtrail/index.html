@@ -20,6 +20,8 @@
       <button class="tab active" data-tab="status">状态</button>
       <button class="tab" data-tab="log">日志</button>
       <button class="tab" data-tab="tools">工具</button>
+      <button class="tab" data-tab="mem">内存</button>
+      <button class="tab" data-tab="agent">Agent</button>
     </nav>
 
     <main id="views">
@@ -40,6 +42,7 @@
         </div>
         <p class="hint">
           拖动右下角握柄可自由调整窗口大小；折叠后变成可拖动的胶囊，点击展开。
+          内存与 Agent 都在<b>目标进程内</b>运行，不需要 Root。
         </p>
       </section>
 
@@ -66,10 +69,88 @@
         <div id="scripts"></div>
         <p class="status-line" id="tools-status">就绪</p>
       </section>
+
+      <!-- Memory search ------------------------------------------------ -->
+      <!--
+        Everything here runs in the host process against its OWN memory
+        (/proc/self/maps + /proc/self/mem), so there is no pid to type, no root
+        prompt and no shell. A write is the one genuinely dangerous action, which
+        is why it takes two taps: 「写入」 opens a confirmation bar that repeats the
+        exact address and value, and only 「确认」 sends the bridge message.
+      -->
+      <section class="view" data-view="mem">
+        <div class="row">
+          <select class="select" id="mem-type" title="搜索类型">
+            <option value="int32">int32</option>
+            <option value="int64">int64</option>
+            <option value="float32">float32</option>
+            <option value="float64">float64</option>
+            <option value="utf8">utf8</option>
+          </select>
+          <input class="input" id="mem-value" type="text" inputmode="text"
+                 autocomplete="off" autocorrect="off" spellcheck="false"
+                 placeholder="要搜索的值">
+        </div>
+        <div class="row">
+          <button class="action" id="btn-mem-scan">首次扫描</button>
+          <button class="action" id="btn-mem-refine">再次扫描</button>
+        </div>
+        <label class="check">
+          <input type="checkbox" id="mem-writable">
+          只搜可写内存（默认关：代码段里的常量也要能搜到）
+        </label>
+        <p class="status-line" id="mem-status">就绪</p>
+        <p class="hint" id="mem-note"></p>
+        <div id="mem-results"></div>
+        <div class="row" style="margin-top:8px">
+          <button class="action" id="btn-mem-clear">清空搜索结果</button>
+          <button class="action" id="btn-mem-revert-all" disabled>还原全部修改（0）</button>
+        </div>
+      </section>
+
+      <!-- Agent -------------------------------------------------------- -->
+      <!--
+        Two ways in, and the difference is stated in the UI rather than hidden:
+          * the chat box drives a real ReAct loop against an OpenAI-compatible
+            endpoint *from this process*, using the same tools the console exposes;
+          * the console runs one tool with hand-written JSON, which still works when
+            the model is unconfigured or the host app has no INTERNET permission.
+      -->
+      <section class="view" data-view="agent">
+        <p class="hint" id="agent-state">正在读取 Agent 配置…</p>
+        <div id="agent-log"></div>
+        <div class="row">
+          <input class="input" id="agent-input" type="text" autocomplete="off"
+                 placeholder="问 Agent：这个界面属于哪个 Activity？">
+          <button class="action narrow" id="btn-agent-send">发送</button>
+        </div>
+        <label class="check">
+          <input type="checkbox" id="agent-destructive">
+          允许破坏性操作（写内存 / 改字段 / 挂钩子），默认关闭
+        </label>
+        <div class="row">
+          <button class="action" id="btn-agent-stop">停止</button>
+          <button class="action" id="btn-agent-reset">清空对话</button>
+        </div>
+        <p class="status-line" id="agent-status">就绪</p>
+        <details id="agent-console">
+          <summary>工具控制台（直接调用进程内工具）</summary>
+          <div class="row" style="margin-top:6px">
+            <input class="input" id="console-input" type="text" autocomplete="off"
+                   spellcheck="false" placeholder='list_activities {}'>
+            <button class="action narrow" id="btn-console-run">执行</button>
+          </div>
+          <pre id="console-out" class="console-out">可用工具：list_classes / find_class / dump_class /
+list_activities / dump_view_tree / list_hooks / unhook /
+get_field / set_field / get_static_field / call_method /
+hook_method / mem_scan / mem_refine / mem_write / mem_revert</pre>
+        </details>
+      </section>
     </main>
 
-    <!-- Resize affordance. The native side owns the real size: this only drags
-         and reports. Hidden by CSS whenever the window is collapsed. -->
+    <!-- Resize affordance. The page draws the size locally while dragging and
+         tells native code at most once per animation frame; native owns the real
+         window and the persisted value. Hidden by CSS whenever collapsed. -->
     <div id="grip" title="拖动调整窗口大小"></div>
   </div>
 

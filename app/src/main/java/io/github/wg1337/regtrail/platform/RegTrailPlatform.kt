@@ -160,7 +160,10 @@ class RegTrailPlatform(
         // who ignores that prompt must not stall config publishing.
         scope.launch {
             step("openTerminal") {
-                terminal.start(TerminalSession.Mode.Root)
+                // Honour the mode and workspace the user configured; both
+                // default to the values this call used to hard-code.
+                val settings = themeStore.loadSettings()
+                terminal.start(settings.terminalDefaultMode.toAppMode(), settings.terminalWorkspacePath)
                 pushTerminal()
             }
         }
@@ -288,9 +291,9 @@ class RegTrailPlatform(
 
     override fun terminalState(): TerminalUiState = _terminalState.value
 
-    override fun openTerminal(mode: TerminalMode) {
+    override fun openTerminal(mode: TerminalMode, workspacePath: String) {
         scope.launch {
-            terminal.start(mode.toAppMode())
+            terminal.start(mode.toAppMode(), workspacePath)
             pushTerminal()
         }
     }
@@ -519,7 +522,11 @@ class RegTrailPlatform(
 
     private fun addDebugMessage(text: String, isError: Boolean = false) {
         val current = _debugState.value.messages
-        val next = (current + DebugMessageUi(text, isError)).takeLast(60)
+        // The ring-buffer size is a user setting ("日志上限"). Read it here rather
+        // than caching it so the setting takes effect for the very next line,
+        // without the settings page having to push anything into the platform.
+        val limit = themeStore.loadSettings().debugLogLimit.coerceAtLeast(1)
+        val next = (current + DebugMessageUi(text, isError)).takeLast(limit)
         _debugState.value = _debugState.value.copy(messages = next)
         bumpRevision()
     }
@@ -819,11 +826,19 @@ class RegTrailPlatform(
 
     private suspend fun publishConfigInternal(showMessage: Boolean) {
         val theme = themeStore.load()
+        val settings = themeStore.loadSettings()
         val mechanism = themeStore.loadOverlayMechanism()
         val acknowledged = themeStore.loadSystemHookAcknowledged()
+        // Published so the floating window's Agent tab can call the model from
+        // inside the target process. Read through the one store that owns the key
+        // so the settings screens and the module can never disagree about it.
+        val agent = themeStore.loadAgentConfig()
 
         val snapshot = ModuleConfigSnapshot(
-            enabled = true,
+            // The "随目标应用启动时显示悬浮窗" switch. Off means the module is
+            // still loaded (the debugger keeps working) but creates no window in
+            // any target — see `shouldAttach`.
+            enabled = settings.overlayAutoAttach,
             // Only the apps the user explicitly ticked. The old "empty means all
             // scoped apps" reading was ambiguous and is gone: an empty list now
             // means no overlay anywhere, and attachAllScoped is the explicit way
@@ -844,7 +859,21 @@ class RegTrailPlatform(
             // user resets a window they sized badly.
             overlayWidthDp = theme.overlayWidthDp,
             overlayHeightDp = theme.overlayHeightDp,
-            panels = listOf("status", "log", "tools"),
+            // Consumed by `DebugEngine.installHook`: whether to deoptimize the
+            // target method before hooking it.
+            autoDeoptimize = settings.debugAutoDeoptimize,
+            // The Agent endpoint. `agentApiKey` is the one secret in this file;
+            // see the KDoc on the model for why it has to travel here (the window's
+            // Agent runs inside the target process) and what that costs
+            // (/data/local/tmp is world-readable). It is redacted before the
+            // WebView ever sees the config.
+            agentBaseUrl = agent.baseUrl,
+            agentModel = agent.model,
+            agentApiKey = agent.apiKey,
+            agentMaxRounds = agent.maxToolRounds,
+            // `mem` and `agent` are the tabs the panel gained; the page hides any
+            // tab this list does not name, so a stale publish means "no 内存 tab".
+            panels = listOf("status", "log", "tools", "mem", "agent"),
             revision = System.currentTimeMillis(),
         )
 
@@ -894,6 +923,25 @@ class RegTrailPlatform(
     override fun setOverlayMechanism(mechanism: OverlayMechanism, acknowledged: Boolean) {
         themeStore.saveOverlayMechanism(mechanism)
         themeStore.saveSystemHookAcknowledged(acknowledged)
+        scope.launch { publishConfigInternal(showMessage = true) }
+    }
+
+    override fun resetPlatformSettings() {
+        // Only what the platform owns. The theme and `AppSettings` are reset by
+        // `ConfigStore` through its own persist callbacks, and the framework
+        // scope plus produced APKs are deliberately left alone: they describe
+        // what the user is inspecting, not how the app is configured.
+        themeStore.saveOverlayMechanism(OverlayMechanism.DecorView)
+        // Cleared together with the mechanism on purpose: the dangerous hook must
+        // be opted into again, never silently re-armed by a reset.
+        themeStore.saveSystemHookAcknowledged(false)
+        themeStore.clearAgentConfig()
+
+        // Drop the cached session so the next turn re-reads the cleared config
+        // instead of keeping a client built from the old key.
+        agentSession = null
+        pushAgentConfig()
+        refreshScope()
         scope.launch { publishConfigInternal(showMessage = true) }
     }
 

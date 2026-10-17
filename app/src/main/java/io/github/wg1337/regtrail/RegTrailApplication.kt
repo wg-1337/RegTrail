@@ -30,8 +30,10 @@ class RegTrailApplication : Application() {
         val persistence = ThemeConfigStore(this)
 
         config = ConfigStore(
-            initial = persistence.load(),
-            onPersist = { persistence.save(it) },
+            initialTheme = persistence.load(),
+            initialSettings = persistence.loadSettings(),
+            onPersistTheme = { persistence.save(it) },
+            onPersistSettings = { persistence.saveSettings(it) },
         )
         Log.i(TAG, "config store ready")
 

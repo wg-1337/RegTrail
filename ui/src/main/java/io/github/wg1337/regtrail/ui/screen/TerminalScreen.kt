@@ -1,6 +1,5 @@
 package io.github.wg1337.regtrail.ui.screen
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -50,6 +49,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.wg1337.regtrail.ui.screen.settings.SubPageHeader
 import io.github.wg1337.regtrail.ui.terminal.TerminalEntry
 import io.github.wg1337.regtrail.ui.terminal.TerminalMode
 import io.github.wg1337.regtrail.ui.terminal.TerminalUiState
@@ -64,14 +64,20 @@ import io.github.wg1337.regtrail.ui.terminal.TerminalUiState
  *
  * The mode selector is prominent rather than buried: running a command as root
  * versus as the target app is the single most consequential choice here.
+ *
+ * Reached from 设置 → 终端 (and 总览's quick actions); the bottom bar no longer
+ * spends a tab on it. [fontSizeSp] and the starting workspace come from the
+ * terminal settings, which used to be hard-coded.
  */
 @Composable
 fun TerminalScreen(
     state: TerminalUiState,
+    fontSizeSp: Int,
     onCommand: (String) -> Unit,
     onModeChange: (TerminalMode) -> Unit,
     onClear: () -> Unit,
     onReconnect: () -> Unit,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var input by remember { mutableStateOf("") }
@@ -97,25 +103,21 @@ fun TerminalScreen(
             .imePadding(),
     ) {
         // ---- Header ------------------------------------------------------
-        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("终端", style = MaterialTheme.typography.headlineSmall)
-                    Text(
-                        state.statusLine(),
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                if (state.busy) {
-                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                } else {
-                    IconButton(onClick = onClear) {
-                        Icon(Icons.Filled.Clear, contentDescription = "清空")
+        Column(Modifier.padding(horizontal = 8.dp, vertical = 8.dp)) {
+            SubPageHeader(
+                title = "终端",
+                subtitle = state.statusLine(),
+                onBack = onBack,
+                trailing = {
+                    if (state.busy) {
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    } else {
+                        IconButton(onClick = onClear) {
+                            Icon(Icons.Filled.Clear, contentDescription = "清空")
+                        }
                     }
-                }
-            }
+                },
+            )
 
             Spacer(Modifier.height(8.dp))
 
@@ -175,7 +177,9 @@ fun TerminalScreen(
                         .padding(8.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    items(state.entries) { entry -> TerminalLine(entry) }
+                    items(state.entries) { entry ->
+                        TerminalLine(entry, fontSizeSp)
+                    }
                 }
             }
         }
@@ -196,7 +200,7 @@ fun TerminalScreen(
                 placeholder = { Text("输入命令…", fontFamily = FontFamily.Monospace) },
                 textStyle = TextStyle(
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
+                    fontSize = fontSizeSp.sp,
                 ),
                 singleLine = true,
                 enabled = state.connected && !state.busy,
@@ -216,7 +220,7 @@ fun TerminalScreen(
 }
 
 @Composable
-private fun TerminalLine(entry: TerminalEntry) {
+private fun TerminalLine(entry: TerminalEntry, fontSizeSp: Int) {
     val (color, prefix) = when (entry.kind) {
         TerminalEntry.Kind.Command -> Color(0xFF7DD3FC) to "$ "
         TerminalEntry.Kind.Output -> Color(0xFFD6DCE4) to "  "
@@ -229,13 +233,13 @@ private fun TerminalLine(entry: TerminalEntry) {
             prefix,
             color = color.copy(alpha = 0.7f),
             fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
+            fontSize = fontSizeSp.sp,
         )
         Text(
             entry.text,
             color = color,
             fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
+            fontSize = fontSizeSp.sp,
             fontWeight = if (entry.kind == TerminalEntry.Kind.Command) {
                 FontWeight.Medium
             } else {

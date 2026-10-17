@@ -1,6 +1,5 @@
 package io.github.wg1337.regtrail.ui.screen
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,12 +38,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
-import io.github.wg1337.regtrail.ui.agent.AgentConfigUi
 import io.github.wg1337.regtrail.ui.agent.AgentMessageUi
 import io.github.wg1337.regtrail.ui.agent.AgentUiState
 
@@ -56,17 +52,20 @@ import io.github.wg1337.regtrail.ui.agent.AgentUiState
  *    the model would otherwise blame itself;
  *  - **the capability boundary** — the system prompt already refuses register
  *    work, and the UI says so too, so nobody reads a failed attempt as a bug.
+ *
+ * Configuration is *not* here any more. The panel used to be behind a gear icon,
+ * which made "where do I put my API key" undiscoverable; it now lives in
+ * 设置 → Agent, and this screen points at it when nothing is configured.
  */
 @Composable
 fun AgentScreen(
     state: AgentUiState,
     onSend: (String) -> Unit,
     onReset: () -> Unit,
-    onSaveConfig: (baseUrl: String, apiKey: String, model: String, rounds: Int) -> Unit,
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var input by remember { mutableStateOf("") }
-    var showSettings by remember { mutableStateOf(!state.config.isConfigured) }
     val listState = rememberLazyListState()
 
     LaunchedEffect(state.messages.size) {
@@ -108,21 +107,35 @@ fun AgentScreen(
                     )
                 }
                 TextButton(onClick = onReset) { Text("新会话") }
-                IconButton(onClick = { showSettings = !showSettings }) {
-                    Icon(Icons.Filled.Settings, contentDescription = "设置")
+                IconButton(onClick = onOpenSettings) {
+                    Icon(Icons.Filled.Settings, contentDescription = "模型配置")
                 }
             }
         }
 
-        // ---- Configuration -------------------------------------------------
-        if (showSettings) {
-            AgentConfigPanel(
-                config = state.config,
-                onSave = { baseUrl, apiKey, model, rounds ->
-                    onSaveConfig(baseUrl, apiKey, model, rounds)
-                    showSettings = false
-                },
-            )
+        // ---- Configuration call-to-action ----------------------------------
+        // Only when it is actionable: a permanent banner would be noise once the
+        // model is configured (the header already says whether it is).
+        if (!state.config.isConfigured) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("还没有可用的模型", style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "填好 Base URL、API Key 与模型名后才能开始对话。",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = onOpenSettings) { Text("填写模型配置") }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
         }
 
         // ---- Conversation ---------------------------------------------------
@@ -252,91 +265,12 @@ private fun MessageBubble(message: AgentMessageUi) {
     }
 }
 
-@Composable
-private fun AgentConfigPanel(
-    config: AgentConfigUi,
-    onSave: (String, String, String, Int) -> Unit,
-) {
-    var baseUrl by remember { mutableStateOf(config.baseUrl) }
-    var apiKey by remember { mutableStateOf("") }
-    var model by remember { mutableStateOf(config.model) }
-    var rounds by remember { mutableStateOf(config.maxToolRounds.toString()) }
-
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        shape = RoundedCornerShape(12.dp),
-    ) {
-        Column(Modifier.padding(12.dp)) {
-            Text("模型配置", style = MaterialTheme.typography.titleSmall)
-            Spacer(Modifier.height(8.dp))
-
-            OutlinedTextField(
-                value = baseUrl,
-                onValueChange = { baseUrl = it },
-                label = { Text("Base URL（含 /v1）") },
-                placeholder = { Text("https://api.openai.com/v1") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(8.dp))
-
-            OutlinedTextField(
-                value = apiKey,
-                onValueChange = { apiKey = it },
-                label = { Text(if (config.hasApiKey) "API Key（已保存，留空则不修改）" else "API Key") },
-                singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(8.dp))
-
-            OutlinedTextField(
-                value = model,
-                onValueChange = { model = it },
-                label = { Text("模型名") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(8.dp))
-
-            OutlinedTextField(
-                value = rounds,
-                onValueChange = { rounds = it.filter { ch -> ch.isDigit() } },
-                label = { Text("最大工具轮数") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(6.dp))
-
-            Text(
-                "Key 仅保存在本机 SharedPreferences，不会上传到除该 Base URL 之外的任何地方。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(10.dp))
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = {
-                        onSave(
-                            baseUrl.trim(),
-                            apiKey.trim(),
-                            model.trim(),
-                            rounds.toIntOrNull()?.coerceIn(1, 30) ?: 8,
-                        )
-                    },
-                    modifier = Modifier.weight(1f),
-                ) { Text("保存") }
-            }
-        }
-    }
-    Spacer(Modifier.height(8.dp))
-}
-
-/** A one-line capability note reused elsewhere in the app. */
+/**
+ * A one-line capability note reused elsewhere in the app.
+ *
+ * Kept next to the chat because it is the sentence the chat's empty state and
+ * the Agent settings page both need to stay honest about.
+ */
 internal const val AGENT_CAPABILITY_NOTE =
     "Agent 可检查类/字段/View 树、挂方法 Hook、读写静态字段、以 Root 执行命令；" +
         "不能读取 CPU 寄存器。"

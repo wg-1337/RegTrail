@@ -158,8 +158,8 @@ fun ScopeScreen(
                         )
                         Spacer(Modifier.height(8.dp))
                         Text(
-                            "如果你改主意了，可以在「外观 → 注入悬浮窗」里切回默认的「内嵌式」，" +
-                                "那种方式完全不需要 system 作用域。",
+                            "如果你改主意了，可以在「设置 → 悬浮窗 → 注入方式」里切回默认的" +
+                                "「内嵌式」，那种方式完全不需要 system 作用域。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

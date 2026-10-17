@@ -3,6 +3,7 @@ package io.github.wg1337.regtrail.xposed.debug
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import io.github.wg1337.regtrail.xposed.RegTrailLog
+import io.github.wg1337.regtrail.xposed.overlay.ModuleConfig
 import java.lang.reflect.Executable
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -38,6 +39,16 @@ internal object DebugEngine {
 
     private lateinit var module: XposedModule
 
+    /**
+     * Config reader, so "deoptimize before hooking" honours the published
+     * `autoDeoptimize` switch.
+     *
+     * Built once at [attach] rather than per hook install: `ModuleConfig`
+     * caches the parsed snapshot and only re-`stat`s the file, so holding one
+     * instance is both cheaper and the same object the rest of the module uses.
+     */
+    private var config: ModuleConfig? = null
+
     private val hooks = ConcurrentHashMap<String, HookState>()
 
     private val hookSeq = AtomicLong(0)
@@ -47,6 +58,7 @@ internal object DebugEngine {
 
     fun attach(module: XposedModule) {
         this.module = module
+        this.config = ModuleConfig(module)
     }
 
     val isAttached: Boolean get() = ::module.isInitialized
@@ -201,8 +213,12 @@ internal object DebugEngine {
         }
 
         // Deoptimize first: if the method was inlined into a caller, a hook would
-        // otherwise never fire.
-        runCatching { module.deoptimize(target) }
+        // otherwise never fire. Skippable from the settings app ("自动
+        // deoptimize"), because forcing the recompile is measurable in a hot
+        // method; an unreadable config keeps the historical behaviour (on).
+        if (autoDeoptimize()) {
+            runCatching { module.deoptimize(target) }
+        }
 
         val state = HookState(id = id, target = target, label = label, behavior = behavior)
 
@@ -219,6 +235,18 @@ internal object DebugEngine {
         RegTrailLog.i("hook installed: $id → ${describe(target)}")
         id
     }
+
+    /**
+     * The published `autoDeoptimize` switch, defaulting to `true`.
+     *
+     * Every failure path (config not readable yet, malformed JSON, module
+     * attached without a config) resolves to the behaviour that shipped before
+     * the switch existed, because "hook never fires" is a far worse failure
+     * than "method was recompiled".
+     */
+    private fun autoDeoptimize(): Boolean = runCatching {
+        config?.reload()?.autoDeoptimize ?: true
+    }.getOrDefault(true)
 
     fun unhook(id: String): Boolean {
         val state = hooks.remove(id) ?: return false

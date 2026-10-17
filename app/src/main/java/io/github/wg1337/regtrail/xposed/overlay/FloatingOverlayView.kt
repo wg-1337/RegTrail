@@ -56,6 +56,16 @@ internal class FloatingOverlayView(
     /** Set by the controller so the drag handler can update window gravity. */
     var onDrag: ((dx: Int, dy: Int) -> Unit)? = null
 
+    /**
+     * Called when BACK is pressed while this window has input focus.
+     *
+     * Only the real overlay window sets it: there, a focusable window intercepts
+     * BACK, and the first press must close the keyboard / drop focus instead of
+     * leaving the user unable to navigate the host app. The DecorView fallback
+     * leaves it null, because there BACK belongs to the Activity.
+     */
+    var onBack: (() -> Unit)? = null
+
     private var collapsed = false
 
     private var downRawX = 0f
@@ -69,6 +79,22 @@ internal class FloatingOverlayView(
 
     init {
         setBackgroundColor(Color.TRANSPARENT)
+
+        /*
+         * The *whole* collapsed window expands on tap, not just the pill graphic.
+         *
+         * The window is sized [COLLAPSED_WIDTH_DP] x [COLLAPSED_HEIGHT_DP] while
+         * the pill itself is `wrap_content`, so several dp of transparent
+         * container surround the pill. A user aiming at "the floating thing"
+         * frequently lands on that transparent margin; without this listener those
+         * taps went nowhere and the window read as un-expandable.
+         *
+         * `isClickable` is toggled together with the collapsed state in
+         * [setCollapsed]: while expanded this view must not consume anything, or
+         * it would steal taps the WebView never handles (gutter around a rounded
+         * panel corner).
+         */
+        setOnClickListener { expand() }
 
         webView = WebView(context).apply {
             setBackgroundColor(Color.TRANSPARENT)
@@ -97,6 +123,10 @@ internal class FloatingOverlayView(
                 gravity = Gravity.CENTER
             },
         )
+
+        // `setOnClickListener` made this view clickable; undo that until the window
+        // actually collapses (see [setCollapsed] for the reasoning).
+        isClickable = false
     }
 
     /**
@@ -148,13 +178,27 @@ internal class FloatingOverlayView(
         )
 
         visibility = GONE
-        // Drag anywhere on the pill, tap to expand. `dragListener()` returns
-        // false for ACTION_UP on purpose so the click still fires — see there.
-        setOnTouchListener(dragListener())
-        setOnClickListener {
-            setCollapsed(false)
-            onCollapsedChanged(false)
-        }
+        // Drag anywhere on the pill, tap to expand. The listener *never* yields a
+        // touch back to `View.onTouchEvent` — see [pillTouchListener] for why
+        // returning false on ACTION_UP did not make the click fire.
+        setOnTouchListener(pillTouchListener())
+        setOnClickListener { expand() }
+    }
+
+    /**
+     * Expands the panel and tells the controller, exactly once.
+     *
+     * ## Why this is not inlined in the click listeners
+     * Two listeners can call it (the pill and the container). Both must be
+     * idempotent: a double tap, or a tap that lands while the previous expand is
+     * still being applied on the main thread, must not run the controller's
+     * transition twice — the second run would re-apply the size and fight an
+     * in-flight layout pass.
+     */
+    private fun expand() {
+        if (!collapsed) return
+        setCollapsed(false)
+        onCollapsedChanged(false)
     }
 
     /**
@@ -163,14 +207,25 @@ internal class FloatingOverlayView(
      * ## What this must not do
      * It must not call `loadUrl` / `reload`. The WebView carries the whole UI
      * state — the selected tab, the scrolled log, the script list fetched from
-     * the bridge — and collapsing is a *window size* change, not a navigation.
-     * Hiding the view keeps that state; reloading would throw it away and make
-     * expand feel like a fresh start.
+     * the bridge, the memory result list — and collapsing is a *window size*
+     * change, not a navigation. Hiding the view keeps that state; reloading would
+     * throw it away and make expand feel like a fresh start.
      */
     fun setCollapsed(value: Boolean) {
         collapsed = value
         webView.visibility = if (value) GONE else VISIBLE
         collapsedPill.visibility = if (value) VISIBLE else GONE
+        /*
+         * Only the pill may absorb a tap-to-open.
+         *
+         * While expanded the container must stay non-clickable: the WebView is
+         * `MATCH_PARENT` and normally consumes every touch inside the window, but
+         * a tap that the web engine declines (the transparent margin outside the
+         * rounded panel corner) would otherwise be swallowed here — and a
+         * swallowed touch in a floating window is indistinguishable from a frozen
+         * host app.
+         */
+        isClickable = value
         evaluateJavascript(
             "window.RegTrail && window.RegTrail.onCollapsed($value);",
         )
@@ -197,6 +252,26 @@ internal class FloatingOverlayView(
         runCatching { webView.evaluateJavascript(script, null) }
     }
 
+    /**
+     * Swallows BACK while this window is the focus target.
+     *
+     * The window is normally `FLAG_NOT_FOCUSABLE`, so it never sees a key event at
+     * all. It becomes focusable only while a text field is being edited (see
+     * `OverlayController.setImeFocus`), and in that state BACK would otherwise be
+     * consumed by the WebView and do nothing — the host app would appear to have
+     * lost its back button. Reporting the press to [onBack] lets the controller
+     * drop focus, so the *next* BACK reaches the host app again.
+     */
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        val handler = onBack ?: return super.dispatchKeyEvent(event)
+        if (event.keyCode == android.view.KeyEvent.KEYCODE_BACK) {
+            if (event.action == android.view.KeyEvent.ACTION_UP) handler()
+            // Consume both DOWN and UP: one physical press, one action.
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     fun destroy() {
         runCatching {
             removeView(webView)
@@ -204,7 +279,35 @@ internal class FloatingOverlayView(
         }
     }
 
-    private fun dragListener() = object : OnTouchListener {
+    /**
+     * Drag anywhere on the pill, *tap* to expand.
+     *
+     * ## The bug this replaces (regression: "collapse leaves a pill you cannot tap")
+     * The previous listener returned `true` for `ACTION_DOWN` (it had to — that is
+     * what keeps the subsequent `ACTION_MOVE` stream coming) and `false` for
+     * `ACTION_UP` when the gesture had not travelled past the touch slop, in the
+     * belief that "returning false on UP lets the click fire".
+     *
+     * That belief is wrong, and it is the whole root cause. `View.dispatchTouchEvent`
+     * only reaches `View.onTouchEvent` when the touch listener returns `false`, and
+     * `onTouchEvent` is the only place that sets `PFLAG_PRESSED` on
+     * `ACTION_DOWN`. Its `ACTION_UP` branch dispatches the click **inside**
+     *
+     * ```java
+     * if ((mPrivateFlags & PFLAG_PRESSED) != 0 || prepressed) { … performClick() … }
+     * ```
+     *
+     * so an `ACTION_UP` delivered to a view that never saw the `ACTION_DOWN`
+     * performs no click at all — the handler installed with `setOnClickListener`
+     * was unreachable. Collapse worked (the header's `-` button lives in the
+     * WebView and posts through the bridge), and expand never did.
+     *
+     * The fix: consume every event and turn the tap into an explicit
+     * `performClick()` from here, which is also the accessibility-correct path
+     * (it announces the click to a screen reader and keeps `OnClickListener`
+     * the single definition of "what a tap does").
+     */
+    private fun pillTouchListener() = object : OnTouchListener {
         override fun onTouch(v: View, event: MotionEvent): Boolean {
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -225,18 +328,18 @@ internal class FloatingOverlayView(
                 }
 
                 MotionEvent.ACTION_UP -> {
-                    // Distinguish a tap (expand) from the end of a drag. Returning
-                    // true here *consumes* the event, which suppresses the click:
-                    // expanding the panel every time the user repositions the pill
-                    // is the most annoying possible interaction bug.
+                    // Distinguish a tap (expand) from the end of a drag: expanding
+                    // the panel every time the user repositions the pill is the
+                    // most annoying possible interaction bug.
                     val wasDrag = dragDistance > touchSlop
                     dragDistance = 0f
-                    return wasDrag
+                    if (!wasDrag) v.performClick()
+                    return true
                 }
 
                 MotionEvent.ACTION_CANCEL -> {
                     dragDistance = 0f
-                    return false
+                    return true
                 }
             }
             return false

@@ -85,7 +85,7 @@ class RegTrailModule : XposedModule() {
                 TAG,
                 "system_server: ApplicationOverlay requested but the user has not " +
                     "acknowledged the bootloop risk; refusing to hook. " +
-                    "Enable it in RegTrail's 外观 → 悬浮窗设置.",
+                    "Enable it in RegTrail's 设置 → 悬浮窗 → 注入方式.",
             )
             return
         }

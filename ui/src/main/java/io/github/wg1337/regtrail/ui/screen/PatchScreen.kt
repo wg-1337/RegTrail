@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.dp
 import io.github.wg1337.regtrail.ui.patch.PatchRecordUi
 import io.github.wg1337.regtrail.ui.patch.PatchTargetUi
 import io.github.wg1337.regtrail.ui.patch.PatchUiState
+import io.github.wg1337.regtrail.ui.screen.settings.SubPageHeader
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -52,6 +53,9 @@ import java.util.Locale
  *     apps mid-write.
  *  3. **Hand back a path.** The result is a file, so the only useful output is its
  *     exact location, selectable so it can be copied into a file manager.
+ *
+ * Reached from 设置 → 打包 and from 总览's quick actions. It keeps its own screen
+ * because it produces a file and runs for minutes; it is not a settings page.
  */
 @Composable
 fun PatchScreen(
@@ -59,6 +63,7 @@ fun PatchScreen(
     onRefresh: () -> Unit,
     onGenerate: (String) -> Unit,
     onDeleteRecord: (String) -> Unit,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var query by remember { mutableStateOf("") }
@@ -80,23 +85,20 @@ fun PatchScreen(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         item {
-            Spacer(Modifier.height(16.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("免 Root 打包", style = MaterialTheme.typography.headlineSmall)
-                    Text(
-                        "把已安装的应用复制、注入悬浮窗载荷并重新签名，" +
-                            "得到无需 Root、也无需 LSPosed 即可安装的 APK",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                if (state.loading) {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                } else {
-                    TextButton(onClick = onRefresh, enabled = !state.busy) { Text("刷新") }
-                }
-            }
+            Spacer(Modifier.height(8.dp))
+            SubPageHeader(
+                title = "免 Root 打包",
+                subtitle = "把已安装的应用复制、注入悬浮窗载荷并重新签名，" +
+                    "得到无需 Root、也无需 LSPosed 即可安装的 APK",
+                onBack = onBack,
+                trailing = {
+                    if (state.loading) {
+                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    } else {
+                        TextButton(onClick = onRefresh, enabled = !state.busy) { Text("刷新") }
+                    }
+                },
+            )
         }
 
         // ---- The four non-negotiable warnings ----------------------------
