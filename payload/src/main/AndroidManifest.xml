@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The payload library declares no components of its own.
+
+  Everything it needs is declared by the *target* APK's manifest after patching:
+  a single `android:appComponentFactory` attribute pointing at
+  `io.github.wg1337.regtrail.payload.RegTrailAppFactory`. No permissions are
+  added, because the panel attaches into the host's own content view (see
+  OverlayHost) and therefore needs no SYSTEM_ALERT_WINDOW.
+
+  This manifest exists only because AGP requires one for a library module. The
+  module is never installed on its own; its classes are dexed into `payload.dex`.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

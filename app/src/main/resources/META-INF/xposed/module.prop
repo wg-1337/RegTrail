@@ -1,0 +1,32 @@
+# LSPosed / Vector module descriptor (Java Properties format).
+#
+# Read from META-INF/xposed/module.prop inside the APK. Modern modules carry NO
+# <meta-data> in AndroidManifest.xml: the module's display name is the
+# application's android:label and its description is android:description
+# (see docs/PLAN.md 2.2).
+#
+# !!! THIS FILE IS THE REASON THE MODULE WAS NOT DETECTED BEFORE !!!
+# A module with no META-INF/xposed/ directory and no legacy assets/xposed_init
+# is not a module at all, so the framework had nothing to list.
+
+# Minimum Xposed API version required by this module.
+minApiVersion=102
+
+# Target API version. This is what selects the load strategy:
+#   >= 101 -> MODERN (java_init.list)
+#   == 100 -> UNSUPPORTED (refused outright)
+#     < 100 with assets/xposed_init present -> LEGACY
+targetApiVersion=102
+
+# NOTE: `staticScope` is deliberately NOT set.
+# Setting staticScope=true makes the daemon *enforce* a fixed scope, which would
+# stop the user from selecting arbitrary target apps and would make our own
+# requestScope() calls fail with "This module declares a static scope, so X
+# cannot be added". RegTrail must stay user-configurable, so we leave it unset.
+
+# API 102 feature: allow the manager to offer hot-reload after this app updates.
+autoHotReload=true
+
+# Keep the framework's protective exception handling (default). Flip to
+# `passthrough` only when debugging hook crashes.
+exceptionMode=protective

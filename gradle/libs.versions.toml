@@ -1,0 +1,100 @@
+[versions]
+# ---- Toolchain -----------------------------------------------------------
+# Gradle 9.6.1 is already in ~/.gradle/wrapper/dists (no download needed).
+# AGP 9.4.1 is already in the dependency cache. KMP is NOT used, so the
+# Kotlin-2.4.x cap of "AGP <= 9.3.1" does not apply here.
+agp = "9.4.1"
+kotlin = "2.4.21"
+
+# ---- Android SDK levels --------------------------------------------------
+compileSdk = "37"
+targetSdk = "36"
+minSdk = "27"
+
+# ---- Compose (AndroidX only; Compose Multiplatform deliberately unused) ---
+composeBom = "2026.09.00"
+activityCompose = "1.13.0"
+lifecycle = "2.11.0"
+navigationCompose = "2.10.2"
+coreKtx = "1.19.1"
+
+# ---- Kotlin libraries ----------------------------------------------------
+coroutines = "1.11.0"
+serialization = "1.11.0"
+
+# ---- Theming helpers -----------------------------------------------------
+materialColorUtilities = "6.0.0"
+
+# ---- LSPosed module ------------------------------------------------------
+# Modern Xposed API. `api` must be compileOnly; `service` ships the
+# ${applicationId}.XposedService provider.
+libxposedApi = "102.0.0"
+libxposedService = "102.0.0"
+
+# ---- Root ----------------------------------------------------------------
+# libsu is published on JitPack only (NOT Maven Central).
+libsu = "6.0.0"
+
+# ---- Persistent injection (P6) -------------------------------------------
+# apksig MUST come from Google Maven: Maven Central stopped publishing it at
+# 2.3.0 (2017), and a stale apksig would silently produce v1-only signatures.
+# It is Apache-2.0 and has no transitive dependencies.
+apksig = "9.4.1"
+# Binary AndroidManifest.xml editing. JitPack only (never published to Central);
+# Apache-2.0. This is the library both Xpatch and LSPatch use because it writes
+# attributes the platform actually resolves (e.g. TYPE_INT_BOOLEAN vs STRING).
+manifestEditor = "v2.0"
+# On-device keystore generation: Android ships no `keytool`, so the self-signed
+# signing cert is built with BouncyCastle in-process. The `jdk15to18` line is the
+# one that avoids the Java 9+ module/naming assumptions of `jdk18on` on ART.
+bouncyCastle = "1.86"
+
+[libraries]
+# Compose (versions come from the BOM)
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-ui-graphics = { module = "androidx.compose.ui:ui-graphics" }
+compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
+compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+compose-foundation = { module = "androidx.compose.foundation:foundation" }
+compose-material3 = { module = "androidx.compose.material3:material3" }
+compose-material-icons-extended = { module = "androidx.compose.material:material-icons-extended" }
+
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
+androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+androidx-navigation-compose = { module = "androidx.navigation:navigation-compose", version.ref = "navigationCompose" }
+
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
+
+material-color-utilities = { module = "com.materialkolor:material-color-utilities", version.ref = "materialColorUtilities" }
+
+# LSPosed module API. `api` is compileOnly — bundling it makes the framework
+# refuse to load the module.
+libxposed-api = { module = "io.github.libxposed:api", version.ref = "libxposedApi" }
+libxposed-service = { module = "io.github.libxposed:service", version.ref = "libxposedService" }
+
+# Root shell / persistent root service.
+libsu-core = { module = "com.github.topjohnwu.libsu:core", version.ref = "libsu" }
+libsu-service = { module = "com.github.topjohnwu.libsu:service", version.ref = "libsu" }
+libsu-nio = { module = "com.github.topjohnwu.libsu:nio", version.ref = "libsu" }
+
+# P6 — persistent injection. All three are permissive licences (Apache-2.0 /
+# MIT-style) and all three run on ART: apksig and ManifestEditor use no JRE-only
+# APIs, BouncyCastle's jdk15to18 line targets Java 5-8 APIs.
+apksig = { module = "com.android.tools.build:apksig", version.ref = "apksig" }
+manifest-editor = { module = "com.github.WindySha:ManifestEditor", version.ref = "manifestEditor" }
+bouncycastle-bcpkix = { module = "org.bouncycastle:bcpkix-jdk15to18", version.ref = "bouncyCastle" }
+bouncycastle-bcprov = { module = "org.bouncycastle:bcprov-jdk15to18", version.ref = "bouncyCastle" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+# NOTE: org.jetbrains.kotlin.android is an ERROR on AGP 9 (Kotlin is built in).
+# We therefore declare only the Compose compiler plugin and the serialization
+# plugin, and pin their version on the buildscript classpath via `apply false`
+# in the root build script.
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

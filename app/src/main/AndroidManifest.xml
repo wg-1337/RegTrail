@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      Required so the app picker can list everything installed.
+
+      Without it, Android 11+ (API 30) package visibility filters
+      PackageManager.getInstalledApplications() down to a tiny set — for this app
+      that meant system framework entries only, so the "目标" screen had nothing
+      to offer. QUERY_ALL_PACKAGES is the sanctioned way for a tool that must
+      enumerate apps; it is a normal permission and does not need a runtime
+      request.
+
+      Root itself comes from the su manager (Magisk / KernelSU / APatch), not from
+      an Android permission, so no other permission is declared.
+    -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <!--
+      The Agent talks to an OpenAI-compatible endpoint over HTTPS. Nothing else
+      in the app uses the network: the floating window's UI is served from the
+      module APK itself, and the settings/module channel is a local file.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      The LSPosed module declaration is NOT in this file. Modern-API modules carry
+      their metadata as resources at META-INF/xposed/ inside the APK:
+        - java_init.list  : entry class names
+        - module.prop     : minApiVersion / targetApiVersion / ...
+        - scope.list      : recommended scope
+      A module with none of those (and no legacy assets/xposed_init) is not
+      detected at all. The module's display name comes from android:label and its
+      description from android:description.
+    -->
+
+    <application
+        android:name=".RegTrailApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:description="@string/module_description"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.RegTrail">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.RegTrail">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!--
+                  Makes the LSPosed manager offer an "open module settings" entry.
+                  This is NOT the module declaration — see the comment above.
+                -->
+                <category android:name="de.robv.android.xposed.category.MODULE_SETTINGS" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          The command channel between the settings app and an injected module.
+
+          The module runs inside a *target* app's process, so the two sides have
+          different UIDs and no shared service. ContentProvider.call() is the
+          lightest cross-UID request/response channel that needs no bind
+          lifecycle, and it survives the settings app being killed.
+
+          Exported by necessity: the caller is another app's process. It only ever
+          dispatches to code the module itself installed in-process, and it never
+          reads or writes any Android data.
+        -->
+        <provider
+            android:name=".xposed.bridge.BridgeProvider"
+            android:authorities="${applicationId}.RegTrailBridge"
+            android:exported="true" />
+
+        <!--
+          Re-arms the module's system_server-side pieces after a reboot without
+          the user having to open the app. Harmless if the module is disabled.
+        -->
+        <receiver
+            android:name=".xposed.BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

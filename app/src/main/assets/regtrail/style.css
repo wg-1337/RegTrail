@@ -1,0 +1,209 @@
+/*
+ * RegTrail floating window styles.
+ *
+ * Theming contract: the settings app chooses `overlayPrimary` and the module
+ * injects it plus the font scale / alpha / corner radius as CSS custom
+ * properties on :root. Every colour below derives from those variables, so the
+ * window re-themes without any native code.
+ */
+
+:root {
+  --regtrail-primary: #ffb300;
+  --regtrail-font-scale: 1;
+  --regtrail-alpha: 0.95;
+  --regtrail-corner: 14px;
+
+  --bg: rgba(18, 18, 20, var(--regtrail-alpha));
+  --bg-elev: rgba(38, 38, 42, var(--regtrail-alpha));
+  --fg: #eceff4;
+  --fg-dim: #9aa0aa;
+  --line: rgba(255, 255, 255, 0.10);
+  --radius: var(--regtrail-corner);
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  color: var(--fg);
+  font-family: -apple-system, "Noto Sans CJK SC", "Source Han Sans", Roboto, sans-serif;
+  font-size: calc(13px * var(--regtrail-font-scale));
+  line-height: 1.45;
+  user-select: none;
+}
+
+#panel {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  border-radius: var(--radius);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  overflow: hidden;
+  backdrop-filter: blur(12px);
+}
+
+/* ---- Title bar (drag handle) ---------------------------------------- */
+#bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+
+#bar .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--regtrail-primary);
+  box-shadow: 0 0 8px var(--regtrail-primary);
+}
+
+#bar .title {
+  font-weight: 600;
+  font-size: calc(12px * var(--regtrail-font-scale));
+  letter-spacing: 0.02em;
+  color: var(--regtrail-primary);
+}
+
+#bar .spacer { flex: 1 1 auto; }
+
+button.icon {
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+button.icon:active { background: rgba(255, 255, 255, 0.08); }
+
+/* ---- Tabs ------------------------------------------------------------ */
+#tabs {
+  display: flex;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab {
+  flex: 1 1 0;
+  padding: 7px 4px;
+  border: none;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: calc(12px * var(--regtrail-font-scale));
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+
+.tab.active {
+  color: var(--regtrail-primary);
+  border-bottom-color: var(--regtrail-primary);
+}
+
+/* ---- Views ----------------------------------------------------------- */
+#views {
+  flex: 1 1 auto;
+  overflow: hidden;
+  position: relative;
+}
+
+.view {
+  display: none;
+  position: absolute;
+  inset: 0;
+  padding: 10px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.view.active { display: block; }
+
+/* ---- Definition lists ------------------------------------------------ */
+dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  margin: 0 0 10px;
+}
+
+dt {
+  color: var(--fg-dim);
+  font-size: calc(11px * var(--regtrail-font-scale));
+}
+
+dd {
+  margin: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(11px * var(--regtrail-font-scale));
+  word-break: break-all;
+}
+
+dd.pending { color: var(--fg-dim); font-style: italic; }
+
+/* ---- Buttons --------------------------------------------------------- */
+.row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+button.action {
+  flex: 1 1 0;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-size: calc(11px * var(--regtrail-font-scale));
+  cursor: pointer;
+}
+
+button.action:active {
+  background: var(--regtrail-primary);
+  color: #101014;
+  border-color: var(--regtrail-primary);
+}
+
+/* ---- Log ------------------------------------------------------------- */
+#log {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: calc(10.5px * var(--regtrail-font-scale));
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fg-dim);
+}
+
+#log .line { padding: 1px 0; }
+#log .line.w { color: #ffd166; }
+#log .line.e { color: #ff7b72; }
+#log .line.i { color: var(--fg); }
+
+.hint {
+  color: var(--fg-dim);
+  font-size: calc(10.5px * var(--regtrail-font-scale));
+  margin: 6px 0 0;
+}
+
+/* ---- Scrollbar ------------------------------------------------------- */
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+}

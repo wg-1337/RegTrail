@@ -1,0 +1,26 @@
+# Recommended / declared scope shown to the user in the LSPosed manager.
+#
+# One package name per line. Use `system` (NOT `android`) for system_server —
+# that is the modern-API vocabulary. Legacy modules use the inverted convention
+# and the framework silently swaps the two, which is the classic scope bug when
+# porting an old module.
+#
+# A recommended scope is only a hint: the manager lets the user pick which of
+# these are actually active, and RegTrail also requests scope at runtime through
+# XposedService.requestScope() (see the app's "目标" screen).
+#
+# ---------------------------------------------------------------------------
+# `system` is REQUIRED.
+#
+# The permission-free floating window works by hooking
+# PhoneWindowManager.checkAddPermission, and PhoneWindowManager only exists
+# inside system_server. Without `system` in scope, RegTrail cannot neutralise
+# the SYSTEM_ALERT_WINDOW requirement, and adding an overlay window from a
+# target app will be rejected with a SecurityException.
+#
+# Target apps are NOT listed here on purpose: RegTrail is a general-purpose
+# tool, so which apps to inject into is the user's choice, not a fixed set. Pick
+# them in the LSPosed manager, or press "申请已勾选" on the app's 目标 screen and
+# approve the framework's prompt.
+# ---------------------------------------------------------------------------
+system

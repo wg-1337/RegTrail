@@ -1,0 +1,34 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!--
+      Placeholder mark: a "trail" of three nodes joined by a path, suggesting
+      "register trail" (following a value through a program).
+
+      All paths are pure white: the adaptive icon's `monochrome` variant uses
+      only the alpha channel as a mask, and the background colour is supplied
+      separately. Content is kept inside the 66dp safe zone (21..87) so no
+      launcher mask clips it.
+    -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M41,41 m-8,0 a8,8 0 1,0 16,0 a8,8 0 1,0 -16,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M70,56 m-6.5,0 a6.5,6.5 0 1,0 13,0 a6.5,6.5 0 1,0 -13,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M47,73 m-5.5,0 a5.5,5.5 0 1,0 11,0 a5.5,5.5 0 1,0 -11,0" />
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M47,44 L66,53" />
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M65,60 L51,69" />
+</vector>

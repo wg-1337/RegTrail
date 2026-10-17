@@ -1,0 +1,26 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+*/build/
+.cxx/
+captures/
+
+# Machine-specific configuration
+local.properties
+keystores/
+*.jks
+*.keystore
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Research scratch space (large downloaded tarballs / cloned trees)
+_research/src/
+_research/*.tar.gz*
+_research/*.jar

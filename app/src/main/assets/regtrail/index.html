@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>RegTrail</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="panel">
+    <header id="bar">
+      <span class="dot"></span>
+      <span class="title">RegTrail</span>
+      <span class="spacer"></span>
+      <button class="icon" id="btn-collapse" title="折叠">&#8211;</button>
+      <button class="icon" id="btn-close" title="关闭">&#215;</button>
+    </header>
+
+    <nav id="tabs">
+      <button class="tab active" data-tab="status">状态</button>
+      <button class="tab" data-tab="log">日志</button>
+      <button class="tab" data-tab="tools">工具</button>
+    </nav>
+
+    <main id="views">
+      <!-- Status ------------------------------------------------------- -->
+      <section class="view active" data-view="status">
+        <dl id="status-list">
+          <dt>宿主</dt><dd id="s-package">—</dd>
+          <dt>窗口机制</dt><dd id="s-mechanism">—</dd>
+          <dt>框架</dt><dd id="s-framework">—</dd>
+          <dt>API</dt><dd id="s-api">—</dd>
+          <dt>作用域</dt><dd id="s-targets">—</dd>
+        </dl>
+        <div class="row">
+          <button class="action" id="btn-refresh">刷新配置</button>
+          <button class="action" id="btn-hide">隐藏</button>
+        </div>
+        <p class="hint">
+          窗口位于目标应用进程内，不随 Activity 切换消失。
+        </p>
+      </section>
+
+      <!-- Log ---------------------------------------------------------- -->
+      <section class="view" data-view="log">
+        <div id="log"></div>
+        <div class="row">
+          <button class="action" id="btn-clear">清空</button>
+          <button class="action" id="btn-copy">复制</button>
+        </div>
+      </section>
+
+      <!-- Tools -------------------------------------------------------- -->
+      <section class="view" data-view="tools">
+        <p class="hint">
+          终端、实时调试与 Agent 工具在后续里程碑接入本面板。
+        </p>
+        <dl id="tools-list">
+          <dt>终端</dt><dd class="pending">未接入</dd>
+          <dt>实时调试</dt><dd class="pending">未接入</dd>
+          <dt>Agent</dt><dd class="pending">未接入</dd>
+        </dl>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

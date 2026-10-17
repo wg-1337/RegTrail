@@ -1,0 +1,9 @@
+# LSPosed / Vector modern-API module entry class.
+#
+# Modern (targetApiVersion >= 101) modules are discovered via this file at
+# META-INF/xposed/java_init.list. One fully-qualified class name per line;
+# blank lines and lines starting with '#' are ignored.
+#
+# R8 note: ship `-adaptresourcefilecontents META-INF/xposed/java_init.list` so
+# this name is rewritten if the entry class gets obfuscated (see app/proguard-rules.pro).
+io.github.wg1337.regtrail.xposed.RegTrailModule

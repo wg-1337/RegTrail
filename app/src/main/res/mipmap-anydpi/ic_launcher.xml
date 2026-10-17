@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Non-adaptive fallback for launchers/tools that do not resolve the
+  mipmap-anydpi-v26 adaptive icon. `minSdk` is 27 so every supported device
+  takes the adaptive path, but shipping this keeps `aapt2 dump badging` and
+  third-party launchers happy.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/ic_launcher_background" />
+    <item android:drawable="@drawable/ic_launcher_foreground" />
+</layer-list>

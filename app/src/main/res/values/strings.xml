@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RegTrail</string>
+    <!--
+      For modern-API LSPosed modules the description shown in the manager comes
+      from android:description on <application>, not from a <meta-data> entry.
+    -->
+    <string name="module_description">安卓逆向与实时分析工作台：在目标应用内注入常驻悬浮窗，提供实时分析、终端与调试能力。</string>
+</resources>
