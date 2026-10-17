@@ -213,6 +213,12 @@ internal class DecorOverlayFallback(
                     attach(activity)
                 } else {
                     currentContainer?.bringToFront()
+                    // Re-apply even when the Activity did not change: the display
+                    // metrics can settle *after* the first attach (measured right
+                    // after a reboot), and a re-apply is a pure function of the
+                    // persisted intent, so it can only heal the placement, never
+                    // move a panel the user is happy with.
+                    applyGeometry()
                 }
             }
 
@@ -372,7 +378,7 @@ internal class DecorOverlayFallback(
         val size = appliedSizeDp(intent)
         val widthPx = PanelLayoutMath.px(size.first, d)
         val heightPx = PanelLayoutMath.px(size.second, d)
-        val displayWidthPx = PanelLayoutMath.displayWidthPx(context)
+        val displayWidthPx = displayWidth(context)
         val area = containerRect
             ?: currentContainer?.let { screenRect(it) }
             ?: PanelLayoutMath.displayRect(context)
@@ -491,7 +497,7 @@ internal class DecorOverlayFallback(
     ): PanelPlacement? {
         val view = currentView ?: return null
         val area = containerRect ?: return null
-        val displayWidthPx = PanelLayoutMath.displayWidthPx(view.context)
+        val displayWidthPx = displayWidth(view.context)
 
         val minTop = area.top
         val maxTop = (area.bottom - origin.heightPx).coerceAtLeast(minTop)
@@ -608,7 +614,7 @@ internal class DecorOverlayFallback(
         val area = containerRect ?: return intArrayOf(0, 0, 0, 0)
         val origin = dragOrigin ?: placement ?: return intArrayOf(0, 0, 0, 0)
         val d = density(view.context)
-        val displayWidthPx = PanelLayoutMath.displayWidthPx(view.context)
+        val displayWidthPx = displayWidth(view.context)
 
         val minTop = area.top
         val maxTop = (area.bottom - origin.heightPx).coerceAtLeast(minTop)
@@ -661,6 +667,21 @@ internal class DecorOverlayFallback(
         cachedDensity?.let { return it }
         return PanelLayoutMath.density(context).also { cachedDensity = it }
     }
+
+    /**
+     * The display width, with the container's right edge as a lower bound.
+     *
+     * `endPx` is measured from the display's right edge, so a wrong display width
+     * translates the panel horizontally. The Activity's `displayMetrics` can be
+     * wrong for a moment after boot (measured: 992 instead of 1200, which put the
+     * panel at the screen's left edge on the first attach after a reboot), and the
+     * container is always inside the display, so its right edge is a safe floor.
+     */
+    private fun displayWidth(context: Context): Int = maxOf(
+        PanelLayoutMath.displayWidthPx(context),
+        containerRect?.right ?: 0,
+        1,
+    )
 
     private companion object {
         /**

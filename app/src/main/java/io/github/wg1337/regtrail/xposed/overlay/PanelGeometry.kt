@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Rect
 import android.os.Build
 import android.util.DisplayMetrics
+import android.view.WindowManager
 import io.github.wg1337.regtrail.shared.model.OverlaySizeLimits
 
 /**
@@ -256,15 +257,21 @@ internal object PanelLayoutMath {
     ): PanelPlacement {
         val laidOut = container.width() > 0 && container.height() > 0
 
+        // A container is always inside the display, so its right edge is a safe
+        // lower bound for the display width when the metrics are still settling
+        // (they are, on this device, for a moment after boot — see
+        // [displaySizePx]).
+        val displayWidth = maxOf(displayWidthPx, container.right, 1)
+
         // The default is expressed against the container (that is what "top-right
         // corner of the content area" means); the stored value is absolute.
-        val defaultEndGap = displayWidthPx - container.right + px(DEFAULT_END_DP, density)
+        val defaultEndGap = displayWidth - container.right + px(DEFAULT_END_DP, density)
         val desiredTopPx = geometry.topPx
             ?: (container.top + px(DEFAULT_TOP_DP, density))
         val desiredEndGapPx = geometry.endPx ?: defaultEndGap
 
         var marginTop = desiredTopPx - container.top
-        var marginEnd = container.right - (displayWidthPx - desiredEndGapPx)
+        var marginEnd = container.right - (displayWidth - desiredEndGapPx)
 
         if (laidOut) {
             // Fully inside the content area when it fits; pinned to the top/right
@@ -274,11 +281,11 @@ internal object PanelLayoutMath {
         }
 
         val topPx = container.top + marginTop
-        val endGapPx = displayWidthPx - (container.right - marginEnd)
+        val endGapPx = displayWidth - (container.right - marginEnd)
         return PanelPlacement(
             widthPx = widthPx,
             heightPx = heightPx,
-            leftPx = displayWidthPx - endGapPx - widthPx,
+            leftPx = displayWidth - endGapPx - widthPx,
             topPx = topPx,
             endGapPx = endGapPx,
             marginTopPx = marginTop,
@@ -294,11 +301,46 @@ internal object PanelLayoutMath {
      * starting at 0,0 and visibly jumping.
      */
     fun displayRect(context: Context): Rect {
+        val (width, height) = displaySizePx(context)
+        return Rect(0, 0, maxOf(width, 1), maxOf(height, 1))
+    }
+
+    /**
+     * The display size in pixels, from the **window manager** rather than from the
+     * Activity's `Resources`.
+     *
+     * Measured on the test device right after a reboot: the Activity's
+     * `displayMetrics.widthPixels` was 992 (and later 0) while the display was
+     * 1200 px wide — the host app's 屏幕适配 code rewrites the Activity's metrics,
+     * and during boot they are simply not settled yet. A wrong width here is not
+     * cosmetic: `endPx` is measured from the display's right edge, so the panel
+     * was placed at the left edge of the screen once after a reboot.
+     *
+     * `WindowManager.getCurrentWindowMetrics()` is a binder call to the system's
+     * own window bookkeeping, which is authoritative for every Activity.
+     */
+    @Suppress("DEPRECATION")
+    fun displaySizePx(context: Context): Pair<Int, Int> {
+        runCatching {
+            val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val bounds = wm.currentWindowMetrics.bounds
+                if (bounds.width() > 0 && bounds.height() > 0) {
+                    return bounds.width() to bounds.height()
+                }
+            } else {
+                val metrics = DisplayMetrics()
+                wm.defaultDisplay.getRealMetrics(metrics)
+                if (metrics.widthPixels > 0 && metrics.heightPixels > 0) {
+                    return metrics.widthPixels to metrics.heightPixels
+                }
+            }
+        }
+
         val metrics = context.resources.displayMetrics
-        return Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
+        return metrics.widthPixels to metrics.heightPixels
     }
 
     /** The display width in pixels — the anchor [PanelGeometry.endPx] is measured from. */
-    fun displayWidthPx(context: Context): Int =
-        context.resources.displayMetrics.widthPixels
+    fun displayWidthPx(context: Context): Int = displaySizePx(context).first
 }
